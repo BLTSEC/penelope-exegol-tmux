@@ -11,6 +11,7 @@
 Penelope is a powerful shell handler built as a modern netcat replacement for RCE exploitation, aiming to simplify, accelerate, and optimize post-exploitation workflows.
 
 ## Table of Contents
+- 💀 [BLTSEC Version](bltsec-version)
 - 📥 [Install](#install)
 - ⚙️ [Features](#features)
   - 🖥️ [Session Features](#session-features)
@@ -24,6 +25,42 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 - 📝 [TODO](#todo)
 - ❓ [FAQ](#faq)
 - 🙌 [Thanks to the early birds](#thanks-to-the-early-birds)
+
+# BLTSEC Version
+## Penelope — Exegol + tmux Fork
+
+Forked from [brightio/penelope](https://github.com/brightio/penelope). This version is modified for use within [Exegol](https://github.com/ThePorgs/Exegol) containers with a tmux-based workflow.
+
+### Changes
+
+#### tmux pane support (`Open()`)
+
+The `Open()` function's `terminal=True` mode now checks for an active tmux session (`$TMUX` env var) and opens a new horizontal split pane (`tmux split-window -h`) instead of spawning a separate terminal emulator window. This keeps everything within your existing tmux session — no GUI terminal emulator or `$DISPLAY` required.
+
+The original terminal emulator logic (gnome-terminal, xfce4-terminal, etc.) is preserved as a fallback when tmux is not available.
+
+This affects any feature that opens a secondary terminal, including:
+
+- The **meterpreter** module handler (`msfconsole`)
+- The **script** module output viewer (`tail -f`)
+
+#### Exegol Metasploit paths (`meterpreter` module)
+
+Exegol does not install Metasploit to the default system `$PATH`. Both `msfvenom` and `msfconsole` commands are updated to use the full Exegol-specific invocation:
+
+```
+BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
+  /usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec \
+  /opt/tools/metasploit-framework/msfvenom ...
+```
+
+```
+BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
+  /usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec \
+  /opt/tools/metasploit-framework/msfconsole ...
+```
+
+These match the aliases Exegol sets up for `msfvenom` and `msfconsole`.
 
 ## Install
 
