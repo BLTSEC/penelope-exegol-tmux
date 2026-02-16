@@ -62,7 +62,7 @@ BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
 
 These match the aliases Exegol sets up for `msfvenom` and `msfconsole`.
 
-### Windows upload rewrite — no certutil/mshta/FileServer
+### Windows upload rewrite
 
 The original Windows upload mechanism relied on:
 
@@ -70,25 +70,29 @@ The original Windows upload mechanism relied on:
 2. Using **`certutil -urlcache`** on the target to download a `.bat` and `.zip`
 3. Using **`mshta`** JavaScript to extract the zip
 
-This fails in Exegol (and many modern environments) because:
+This failed in Exegol (and many modern environments) because:
 
 - `certutil` and `mshta` are heavily flagged LOLBINs — Windows Defender / AMSI blocks them
-- The FileServer opens a **separate port** the target must reach, which may not be accessible
 - The original code used `force_cmd=True` for all commands, which wraps them as `cmd /c '...'` in PowerShell shells — but cmd.exe treats single quotes as literal characters, silently breaking every command
+- Attempts to push large files (multi-MB) as base64 chunks through inline shell commands killed the session
 
-**New approach**: Shell-subtype-aware base64 transfer + PowerShell extraction
+**New approach**: Two-tier, shell-subtype-aware upload
 
-- Detects whether the shell is **PowerShell** (`psh`) or **CMD** (`cmd`) and uses native syntax for each
-- **Small payloads** (≤7KB base64): single inline PowerShell command — decode + extract in one shot, no temp files for the b64 data
-- **Large payloads**: chunked transfer using `Set-Content`/`Add-Content` (PowerShell) or `echo >>` (CMD), then `Expand-Archive`
-- No `force_cmd=True` — avoids the `cmd /c '...'` single-quote wrapping that breaks in PowerShell shells
-- No extra ports, no certutil, no mshta
+- Detects whether the shell is **PowerShell** (`psh`) or **CMD** (`cmd`) and uses native syntax for each — no `force_cmd=True`
 
-### Windows download rewrite — no certutil/FileServer
+- **Small payloads** (≤100KB b64 for psh, ≤7KB for cmd): single inline PowerShell command — base64 decode + `Expand-Archive` in one `exec` call, no temp files, no extra ports
 
-The original Windows download also used certutil + FileServer to transfer a `.bat` script to the target. Now:
+- **Large payloads** (e.g. PowerView 752KB, SharpHound 2.3MB, GhostPack 6MB): **FileServer + `Net.WebClient`**
+  - Serves the zip via penelope's built-in FileServer
+  - Target downloads with `(New-Object Net.WebClient).DownloadFile()` — standard .NET, not AV-flagged
+  - Extracts with `Expand-Archive` — not AV-flagged like `mshta`
+  - Single `exec` call — no session-killing barrage of commands
 
-- Detects shell subtype (`psh` vs `cmd`) and sends the PowerShell compress/encode command using the appropriate syntax
+### Windows download rewrite
+
+The original Windows download used certutil + FileServer to transfer a `.bat` script to the target. Now:
+
+- Detects shell subtype (`psh` vs `cmd`) and sends the PowerShell compress/encode command directly through the shell
 - No `force_cmd=True` — eliminates the single-quote wrapping issue
 - No FileServer, no certutil dependency
 
