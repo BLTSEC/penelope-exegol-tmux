@@ -11,7 +11,7 @@
 Penelope is a powerful shell handler built as a modern netcat replacement for RCE exploitation, aiming to simplify, accelerate, and optimize post-exploitation workflows.
 
 ## Table of Contents
-- 💀 [BLTSEC Version](bltsec-version)
+- 💀 [BLTSEC Version](#bltsec-version)
 - 📥 [Install](#install)
 - ⚙️ [Features](#features)
   - 🖥️ [Session Features](#session-features)
