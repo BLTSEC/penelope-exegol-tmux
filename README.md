@@ -27,13 +27,13 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 - 🙌 [Thanks to the early birds](#thanks-to-the-early-birds)
 
 # BLTSEC Version
-## Penelope — Exegol + tmux Fork
+# Penelope — Exegol + tmux Fork
 
 Forked from [brightio/penelope](https://github.com/brightio/penelope). This version is modified for use within [Exegol](https://github.com/ThePorgs/Exegol) containers with a tmux-based workflow.
 
-### Changes
+## Changes
 
-#### tmux pane support (`Open()`)
+### tmux pane support (`Open()`)
 
 The `Open()` function's `terminal=True` mode now checks for an active tmux session (`$TMUX` env var) and opens a new horizontal split pane (`tmux split-window -h`) instead of spawning a separate terminal emulator window. This keeps everything within your existing tmux session — no GUI terminal emulator or `$DISPLAY` required.
 
@@ -44,7 +44,7 @@ This affects any feature that opens a secondary terminal, including:
 - The **meterpreter** module handler (`msfconsole`)
 - The **script** module output viewer (`tail -f`)
 
-#### Exegol Metasploit paths (`meterpreter` module)
+### Exegol Metasploit paths (`meterpreter` module)
 
 Exegol does not install Metasploit to the default system `$PATH`. Both `msfvenom` and `msfconsole` commands are updated to use the full Exegol-specific invocation:
 
@@ -61,6 +61,40 @@ BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
 ```
 
 These match the aliases Exegol sets up for `msfvenom` and `msfconsole`.
+
+### Windows upload rewrite — no certutil/mshta/FileServer
+
+The original Windows upload mechanism relied on:
+
+1. Spinning up a local **FileServer** on an extra port (8000)
+2. Using **`certutil -urlcache`** on the target to download a `.bat` and `.zip`
+3. Using **`mshta`** JavaScript to extract the zip
+
+This fails in Exegol (and many modern environments) because:
+
+- `certutil` and `mshta` are heavily flagged LOLBINs — Windows Defender / AMSI blocks them
+- The FileServer opens a **separate port** the target must reach, which may not be accessible
+- The original code used `force_cmd=True` for all commands, which wraps them as `cmd /c '...'` in PowerShell shells — but cmd.exe treats single quotes as literal characters, silently breaking every command
+
+**New approach**: Shell-subtype-aware base64 transfer + PowerShell extraction
+
+- Detects whether the shell is **PowerShell** (`psh`) or **CMD** (`cmd`) and uses native syntax for each
+- **Small payloads** (≤7KB base64): single inline PowerShell command — decode + extract in one shot, no temp files for the b64 data
+- **Large payloads**: chunked transfer using `Set-Content`/`Add-Content` (PowerShell) or `echo >>` (CMD), then `Expand-Archive`
+- No `force_cmd=True` — avoids the `cmd /c '...'` single-quote wrapping that breaks in PowerShell shells
+- No extra ports, no certutil, no mshta
+
+### Windows download rewrite — no certutil/FileServer
+
+The original Windows download also used certutil + FileServer to transfer a `.bat` script to the target. Now:
+
+- Detects shell subtype (`psh` vs `cmd`) and sends the PowerShell compress/encode command using the appropriate syntax
+- No `force_cmd=True` — eliminates the single-quote wrapping issue
+- No FileServer, no certutil dependency
+
+### Bug fix: `write_access()` Windows check
+
+The Windows `write_access()` check had a missing f-string prefix — the `{write_test_file}` variable was never interpolated, so the test file always had a literal name. Fixed to use an f-string.
 
 ## Install
 
