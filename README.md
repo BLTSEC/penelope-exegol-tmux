@@ -27,78 +27,22 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 - 🙌 [Thanks to the early birds](#thanks-to-the-early-birds)
 
 # BLTSEC Version
-# Penelope — Exegol + tmux Fork
+## Penelope — Exegol + tmux Fork
 
-Forked from [brightio/penelope](https://github.com/brightio/penelope). This version is modified for use within [Exegol](https://github.com/ThePorgs/Exegol) containers with a tmux-based workflow.
+Forked from [brightio/penelope](https://github.com/brightio/penelope), tailored for [Exegol](https://github.com/ThePorgs/Exegol) and tmux-centric workflows.
 
-## Changes
+### Current changes (aligned with `penelope.py` `__version__ = 0.18.4`)
 
-### tmux pane support (`Open()`)
-
-The `Open()` function's `terminal=True` mode now checks for an active tmux session (`$TMUX` env var) and opens a new horizontal split pane (`tmux split-window -h`) instead of spawning a separate terminal emulator window. This keeps everything within your existing tmux session — no GUI terminal emulator or `$DISPLAY` required.
-
-The original terminal emulator logic (gnome-terminal, xfce4-terminal, etc.) is preserved as a fallback when tmux is not available.
-
-This affects any feature that opens a secondary terminal, including:
-
-- The **meterpreter** module handler (`msfconsole`)
-- The **script** module output viewer (`tail -f`)
-
-### Exegol Metasploit paths (`meterpreter` module)
-
-Exegol does not install Metasploit to the default system `$PATH`. Both `msfvenom` and `msfconsole` commands are updated to use the full Exegol-specific invocation:
-
-```
-BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
-  /usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec \
-  /opt/tools/metasploit-framework/msfvenom ...
-```
-
-```
-BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile \
-  /usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec \
-  /opt/tools/metasploit-framework/msfconsole ...
-```
-
-These match the aliases Exegol sets up for `msfvenom` and `msfconsole`.
-
-### Windows upload rewrite
-
-The original Windows upload mechanism relied on:
-
-1. Spinning up a local **FileServer** on an extra port (8000)
-2. Using **`certutil -urlcache`** on the target to download a `.bat` and `.zip`
-3. Using **`mshta`** JavaScript to extract the zip
-
-This failed in Exegol (and many modern environments) because:
-
-- `certutil` and `mshta` are heavily flagged LOLBINs — Windows Defender / AMSI blocks them
-- The original code used `force_cmd=True` for all commands, which wraps them as `cmd /c '...'` in PowerShell shells — but cmd.exe treats single quotes as literal characters, silently breaking every command
-- Attempts to push large files (multi-MB) as base64 chunks through inline shell commands killed the session
-
-**New approach**: Two-tier, shell-subtype-aware upload
-
-- Detects whether the shell is **PowerShell** (`psh`) or **CMD** (`cmd`) and uses native syntax for each — no `force_cmd=True`
-
-- **Small payloads** (≤100KB b64 for psh, ≤7KB for cmd): single inline PowerShell command — base64 decode + `Expand-Archive` in one `exec` call, no temp files, no extra ports
-
-- **Large payloads** (e.g. PowerView 752KB, SharpHound 2.3MB, GhostPack 6MB): **FileServer + `Net.WebClient`**
-  - Serves the zip via penelope's built-in FileServer
-  - Target downloads with `(New-Object Net.WebClient).DownloadFile()` — standard .NET, not AV-flagged
-  - Extracts with `Expand-Archive` — not AV-flagged like `mshta`
-  - Single `exec` call — no session-killing barrage of commands
-
-### Windows download rewrite
-
-The original Windows download used certutil + FileServer to transfer a `.bat` script to the target. Now:
-
-- Detects shell subtype (`psh` vs `cmd`) and sends the PowerShell compress/encode command directly through the shell
-- No `force_cmd=True` — eliminates the single-quote wrapping issue
-- No FileServer, no certutil dependency
-
-### Bug fix: `write_access()` Windows check
-
-The Windows `write_access()` check had a missing f-string prefix — the `{write_test_file}` variable was never interpolated, so the test file always had a literal name. Fixed to use an f-string.
+- `Open(..., terminal=True)` prefers `tmux split-window -h` when `$TMUX` is set, with terminal-emulator fallback outside tmux.
+- `meterpreter` module uses explicit Exegol Metasploit paths (`bundle exec ... msfvenom/msfconsole`) instead of relying on `$PATH`.
+- Windows upload is shell-aware (`psh`/`cmd`) and avoids `certutil`/`mshta`:
+  - small payloads: inline base64 + `Expand-Archive`
+  - large payloads: built-in `FileServer` + `Net.WebClient.DownloadFile()` + `Expand-Archive`
+- Windows download is now robust for repeated runs:
+  - builds archives via PowerShell `-EncodedCommand`
+  - uses begin/end markers for deterministic base64 extraction
+  - resolves relative paths against current remote CWD before archiving
+- Windows `write_access()` temp-file probe uses proper f-string interpolation.
 
 ## Install
 
