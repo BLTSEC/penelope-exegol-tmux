@@ -3531,24 +3531,35 @@ class Session:
 			remote_items_ps = "', '".join(shlex.split(remote_items))
 			if self.subtype == 'psh':
 				cmd = (
-					f"$archivepath='{remote_tempfile}';"
-					f"Compress-Archive -Path '{remote_items_ps}' -DestinationPath $archivepath;"
-					f"$b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($archivepath));"
-					f"Remove-Item $archivepath;"
-					f"Write-Host $b64"
+					f"try {{ "
+					f"Compress-Archive -Path '{remote_items_ps}' "
+					f"-DestinationPath '{remote_tempfile}' -Force -ErrorAction Stop; "
+					f"$bytes = [IO.File]::ReadAllBytes('{remote_tempfile}'); "
+					f"$b64 = [Convert]::ToBase64String($bytes); "
+					f"Remove-Item '{remote_tempfile}' -Force; "
+					f"Write-Output $b64 "
+					f"}} catch {{ Write-Output \"ERROR: $_\" }}"
 				)
 			else:
 				cmd = (
 					f'powershell -ep bypass -c "'
-					f"$archivepath='{remote_tempfile}';"
-					f"Compress-Archive -Path '{remote_items_ps}' -DestinationPath $archivepath;"
-					f"$b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($archivepath));"
-					f"Remove-Item $archivepath;"
-					f'Write-Host $b64"'
+					f"try {{ "
+					f"Compress-Archive -Path '{remote_items_ps}' "
+					f"-DestinationPath '{remote_tempfile}' -Force -ErrorAction Stop; "
+					f"$bytes = [IO.File]::ReadAllBytes('{remote_tempfile}'); "
+					f"$b64 = [Convert]::ToBase64String($bytes); "
+					f"Remove-Item '{remote_tempfile}' -Force; "
+					f"Write-Output $b64 "
+					f"}} catch {{ Write-Output ERROR: $_ }}"
+					f'"'
 				)
 			data = self.exec(cmd, value=True, timeout=None)
 
 			if not data:
+				logger.error("No response from target")
+				return []
+			if data.startswith("ERROR:"):
+				logger.error(f"Remote: {data}")
 				return []
 			downloaded = set()
 			try:
