@@ -1793,48 +1793,46 @@ class Core:
 						readable.kill()
 						break
 
-					# TODO need thread sync
-					target = readable.shell_response_buf\
-					if not readable.subchannel.active\
-					and readable.subchannel.allow_receive_shell_data\
-					else readable.subchannel
+					with readable.data_route_lock:
+						target = readable.shell_response_buf\
+						if not readable.subchannel.active\
+						and readable.subchannel.allow_receive_shell_data\
+						else readable.subchannel
 
-					if readable.agent:
-						for _type, _value in readable.messenger.feed(data):
-							#print(_type, _value)
-							if _type == Messenger.SHELL:
-								if not _value: # TEMP
-									readable.kill()
-									break
-								target.write(_value)
+						if readable.agent:
+							for _type, _value in readable.messenger.feed(data):
+								#print(_type, _value)
+								if _type == Messenger.SHELL:
+									if not _value: # TEMP
+										readable.kill()
+										break
+									target.write(_value)
 
-							elif _type == Messenger.STREAM:
-								stream_id, data = _value[:Messenger.STREAM_BYTES], _value[Messenger.STREAM_BYTES:]
-								#print((repr(stream_id), repr(data)))
-								try:
-									readable.streams[stream_id] << data
-								except (OSError, KeyError):
-									logger.debug(f"Cannot write to stream; Stream <{stream_id}> died prematurely")
-					else:
-						target.write(data)
+								elif _type == Messenger.STREAM:
+									stream_id, data = _value[:Messenger.STREAM_BYTES], _value[Messenger.STREAM_BYTES:]
+									#print((repr(stream_id), repr(data)))
+									try:
+										readable.streams[stream_id] << data
+									except (OSError, KeyError):
+										logger.debug(f"Cannot write to stream; Stream <{stream_id}> died prematurely")
+						else:
+							target.write(data)
 
-					shell_output = readable.shell_response_buf.getvalue() # TODO
-					if shell_output:
-						if readable.is_attached:
-							stdout(shell_output)
+						shell_output = readable.shell_response_buf.getvalue()
+						if shell_output:
+							if readable.is_attached:
+								stdout(shell_output)
 
-						readable.record(shell_output)
+							readable.record(shell_output)
 
-						if b'\x1b[?1049h' in data:
-							readable.alternate_buffer = True
+							if b'\x1b[?1049h' in data:
+								readable.alternate_buffer = True
 
-						if b'\x1b[?1049l' in data:
-							readable.alternate_buffer = False
-						#if readable.subtype == 'cmd' and self._cmd == data:
-						#	data, self._cmd = b'', b'' # TODO
+							if b'\x1b[?1049l' in data:
+								readable.alternate_buffer = False
 
-						readable.shell_response_buf.seek(0)
-						readable.shell_response_buf.truncate(0)
+							readable.shell_response_buf.seek(0)
+							readable.shell_response_buf.truncate(0)
 
 			for writable in writables:
 				with writable.wlock:
@@ -2145,6 +2143,7 @@ class Session:
 			self.last_lines = LineBuffer(options.attach_lines)
 			self.lock = threading.Lock()
 			self.wlock = threading.Lock()
+			self.data_route_lock = threading.Lock()
 
 			self.outbuf = io.BytesIO()
 			self.shell_response_buf = io.BytesIO()
@@ -2386,17 +2385,17 @@ class Session:
 			if not self.systeminfo:
 				return False
 
-			if (not "\n" in self.systeminfo) and ("OS Name" in self.systeminfo): #TODO TEMP PATCH
-				self.exec("cd", force_cmd=True, raw=True)
-				return False
+			# Normalize line endings and strip ANSI escape sequences
+			self.systeminfo = self.systeminfo.replace('\r\n', '\n').replace('\r', '\n')
+			self.systeminfo = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', self.systeminfo)
 
 			def extract_value(pattern):
 				match = re.search(pattern, self.systeminfo, re.MULTILINE)
 				return match.group(1).replace(" ", "_").rstrip() if match else ''
 
-			self.hostname = extract_value(r"^Host Name:\s+(.+)").split('\x1b')[0]
-			self.system = extract_value(r"^OS Name:\s+(.+)").split('\x1b')[0]
-			self.arch = extract_value(r"^System Type:\s+(.+)").split('\x1b')[0]
+			self.hostname = extract_value(r"^Host Name:\s+(.+)")
+			self.system = extract_value(r"^OS Name:\s+(.+)")
+			self.arch = extract_value(r"^System Type:\s+(.+)")
 
 		return True
 
@@ -2625,7 +2624,8 @@ class Session:
 			self.outbuf.seek(0, io.SEEK_END)
 			_len = self.outbuf.write(data)
 
-			self.subchannel.allow_receive_shell_data = True
+			with self.data_route_lock:
+				self.subchannel.allow_receive_shell_data = True
 
 			if self not in core.wlist:
 				core.wlist.append(self)
@@ -2809,17 +2809,13 @@ class Session:
 					timeout = None
 
 					if not r:
-						#stdin_stream.terminate()
-						#stdout_stream.terminate()
-						#stderr_stream.terminate()
-						break # TODO need to clear everything first
+						break
 
 					for readable in r:
 
 						if readable is agent_control:
 							command = agent_control.get()
 							if command == 'stop':
-								# TODO kill task here...
 								break
 
 						if readable is stdin_src:
@@ -2880,10 +2876,21 @@ class Session:
 						continue
 					break
 
-				stdin_stream << b"" # TOCHECK
-				stdin_stream.write(b"")
-				os.close(stdin_stream._read)
-				del self.streams[stdin_stream.id]
+				for stream in (stdin_stream, stdout_stream, stderr_stream):
+					try:
+						stream << b""
+					except OSError:
+						logger.debug(f"Stream {stream.id}: pipe already closed")
+					if stream is stdin_stream:
+						try:
+							stream.write(b"")
+						except OSError:
+							logger.debug(f"Stream {stream.id}: send failed")
+					try:
+						os.close(stream._read)
+					except OSError:
+						logger.debug(f"Stream {stream.id}: read fd already closed")
+					self.streams.pop(stream.id, None)
 
 				return buffer.getvalue().rstrip().decode(errors="replace") if value else True
 			return None
@@ -2904,7 +2911,8 @@ class Session:
 				return False
 
 			self.subchannel.control.clear()
-			self.subchannel.active = True
+			with self.data_route_lock:
+				self.subchannel.active = True
 			self.subchannel.result = None
 			buffer = io.BytesIO()
 			_start = time.perf_counter()
@@ -2935,7 +2943,7 @@ class Session:
 							f"printf ${token[2]}${token[0]}\n".encode()
 						)
 
-					elif self.OS == 'Windows': # TODO fix logic
+					elif self.OS == 'Windows':
 						if self.subtype == 'cmd':
 							cmd = (
 								f"set {token[0]}={token[1]}&set {token[2]}={token[3]}\r\n"
@@ -2948,9 +2956,11 @@ class Session:
 								f"echo $env:{token[0]}$env:{token[2]};{cmd.decode()};"
 								f"echo $env:{token[2]}$env:{token[0]}\r\n".encode()
 							)
-						# TODO check the maxlength on powershell
 						if self.subtype == 'cmd' and len(cmd) > MAX_CMD_PROMPT_LEN:
-							logger.error(f"Max cmd prompt length: {MAX_CMD_PROMPT_LEN} characters")
+							logger.error(f"Max cmd prompt length: {MAX_CMD_PROMPT_LEN} bytes")
+							return False
+						if self.subtype == 'psh' and len(cmd) > MAX_PSH_PROMPT_LEN:
+							logger.error(f"Max PowerShell prompt length: {MAX_PSH_PROMPT_LEN} bytes")
 							return False
 
 					self.subchannel.pattern = re.compile(
@@ -2962,7 +2972,8 @@ class Session:
 				if self.agent and agent_typing:
 					cmd = Messenger.message(Messenger.SHELL, cmd)
 				self.send(cmd)
-				self.subchannel.allow_receive_shell_data = False # TODO
+				with self.data_route_lock:
+					self.subchannel.allow_receive_shell_data = False
 
 			data_timeout = options.short_timeout if timeout is False else timeout
 			continuation_timeout = options.latency
@@ -3046,7 +3057,8 @@ class Session:
 					self.subchannel.result = re.sub(rb'\x1b\[(?:K|\?25h|25l|82X)', b'', self.subchannel.result)
 				self.subchannel.result = self.subchannel.result.strip().decode(errors="replace") # TODO check strip
 			logger.debug(f"{paint('FINAL RESPONSE: ').white_BLUE}{self.subchannel.result}")
-			self.subchannel.active = False
+			with self.data_route_lock:
+				self.subchannel.active = False
 
 			if separate and self.subchannel.result:
 				self.subchannel.result = re.search(rb"..\x01.*", self.subchannel.result, re.DOTALL)[0]
@@ -5767,6 +5779,7 @@ TERMINALS = [
 ]
 TERMINAL = next((term for term in TERMINALS if shutil.which(term)), None)
 MAX_CMD_PROMPT_LEN = 335
+MAX_PSH_PROMPT_LEN = 8100
 LINUX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 URLS = {
 	'linpeas':	"https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh",
