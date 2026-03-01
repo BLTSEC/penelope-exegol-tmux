@@ -973,11 +973,15 @@ class MainMenu(BetterCMD):
 				extra_ = extra if extra is not None else []
 				if current:
 					if not self.sid:
-						if core.sessions:
+						if len(core.sessions) == 1:
+							self.sid = list(core.sessions.keys())[0]
+							logger.debug(f"Auto-selected session {self.sid}")
+						elif core.sessions:
 							cmdlogger.warning("No session ID selected. Select one with \"use [ID]\"")
+							return False
 						else:
 							cmdlogger.warning("No available sessions to perform this action")
-						return False
+							return False
 				else:
 					if ID:
 						if ID.isnumeric() and int(ID) in core.sessions:
@@ -988,6 +992,9 @@ class MainMenu(BetterCMD):
 					else:
 						if self.sid:
 							ID = self.sid
+						elif len(core.sessions) == 1:
+							ID = list(core.sessions.keys())[0]
+							logger.debug(f"Auto-selected session {ID}")
 						else:
 							cmdlogger.warning("No session selected")
 							return None
@@ -2998,7 +3005,8 @@ class Session:
 						self._tmp = directory
 						break
 				else:
-					candidate_dirs = self.exec("find / -type d -writable 2>/dev/null")
+					logger.info("Searching for writable directory...")
+					candidate_dirs = self.exec("find / -maxdepth 3 -type d -writable 2>/dev/null | head -20")
 					if candidate_dirs:
 						for directory in candidate_dirs.decode().splitlines():
 							if directory in common_dirs:
@@ -3935,12 +3943,16 @@ class Session:
 				send_size = int(self.exec(rf"(stat -x {temp} 2>/dev/null || stat {temp}) | sed -n 's/.*Size: \([0-9]*\).*/\1/p'"))
 
 				b64data = io.BytesIO()
+				pbar = PBar(send_size, caption=f" {paint('⤓').cyan} ", barlen=40, metric=Size)
 				for offset in range(0, send_size, options.download_chunk_size):
 					response = self.exec(f"cut -c{offset + 1}-{offset + options.download_chunk_size} {temp}")
 					if response is False:
+						pbar.terminate()
 						logger.error("Download interrupted")
 						return []
 					b64data.write(response)
+					pbar.update(len(response))
+				pbar.terminate()
 				self.exec(f"rm {temp}")
 
 				data = io.BytesIO()
@@ -4251,15 +4263,16 @@ class Session:
 				data = base64.b64encode(tar_buffer.read()).decode()
 				temp = self.tmp + "/" + rand(8)
 
+				pbar = PBar(len(data), caption=f" {paint('⤒').cyan} ", barlen=40, metric=Size)
 				for chunk in chunks(data, options.upload_chunk_size):
 					response = self.exec(f"printf {chunk} >> {temp}")
 					if response is False:
-						#progress_bar.terminate()
+						pbar.terminate()
 						logger.error("Upload interrupted")
 						return [] # TODO
-					#progress_bar.update(len(chunk))
+					pbar.update(len(chunk))
+				pbar.terminate()
 
-				#logger.info(paint("--- Remote unpacking...").blue)
 				dest = f"-C {shlex.quote(remote_path)}" if remote_path else ""
 				cmd = f"base64 -d < {temp} | tar xz {dest} 2>&1; temp=$?"
 				response = self.exec(cmd, value=True)
@@ -5951,14 +5964,14 @@ class Options:
 		self.no_upgrade = False
 		self.debug = False
 		self.dev_mode = False
-		self.latency = .01
+		self.latency = .05
 		self.histlength = 2000
 		self.long_timeout = 60
-		self.short_timeout = 4
+		self.short_timeout = 8
 		self.max_open_files = 5
 		self.verify_ssl_cert = True
 		self.proxy = ''
-		self.upload_chunk_size = 51200
+		self.upload_chunk_size = 262144
 		self.download_chunk_size = 1048576
 		self.network_buffer_size = 16384
 		self.escape = {'sequence':b'\x1b[24~', 'key':'F12'}
