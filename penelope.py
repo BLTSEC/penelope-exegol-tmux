@@ -2195,13 +2195,14 @@ class TmuxBridge:
 		with open(self.script_path, 'w') as f:
 			f.write(TMUX_BRIDGE_CLIENT)
 
-		# Open tmux pane
+		# Open tmux pane (target penelope's own pane so split lands in the right window)
 		escape_hex = options.escape['sequence'].hex()
-		result = subprocess.run(
-			['tmux', 'split-window', '-h', '-d', '-P', '-F', '#{pane_id}',
-			 f'python3 {self.script_path} {self.socket_path} {escape_hex}; rm -f {self.script_path}'],
-			capture_output=True, text=True
-		)
+		split_cmd = ['tmux', 'split-window', '-h', '-d', '-P', '-F', '#{pane_id}']
+		menu_pane = os.environ.get('TMUX_PANE')
+		if menu_pane:
+			split_cmd.extend(['-t', menu_pane])
+		split_cmd.append(f'python3 {self.script_path} {self.socket_path} {escape_hex}; rm -f {self.script_path}')
+		result = subprocess.run(split_cmd, capture_output=True, text=True)
 		if result.returncode != 0:
 			logger.error(f"Failed to create tmux pane: {result.stderr.strip()}")
 			self._cleanup_files()
@@ -2225,12 +2226,13 @@ class TmuxBridge:
 
 		# Rebalance to tiled layout when 3+ panes exist
 		try:
+			target = ['-t', menu_pane] if menu_pane else []
 			pane_count = subprocess.run(
-				['tmux', 'display-message', '-p', '#{window_panes}'],
+				['tmux', 'display-message'] + target + ['-p', '#{window_panes}'],
 				capture_output=True, text=True, timeout=2
 			).stdout.strip()
 			if pane_count.isdigit() and int(pane_count) > 2:
-				subprocess.run(['tmux', 'select-layout', 'tiled'],
+				subprocess.run(['tmux', 'select-layout'] + target + ['tiled'],
 					capture_output=True, timeout=2)
 		except (subprocess.TimeoutExpired, OSError):
 			pass
