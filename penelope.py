@@ -44,6 +44,7 @@ import platform
 import itertools
 import threading
 import subprocess
+import tempfile
 import socketserver
 
 from math import ceil
@@ -301,7 +302,8 @@ def Open(item, terminal=False):
 				args = [_switch, *shlex.split(item)]
 			else:
 				program = 'osascript'
-				args = ['-e', f'tell app "Terminal" to do script "{item}"']
+				escaped_item = item.replace('\\', '\\\\').replace('"', '\\"')
+				args = ['-e', f'tell app "Terminal" to do script "{escaped_item}"']
 
 			if not shutil.which(program):
 				logger.error(f"Cannot open window: '{program}' binary does not exist")
@@ -361,7 +363,7 @@ class Interfaces:
 	@staticmethod
 	def ifconfig():
 		output = subprocess.check_output(['ifconfig']).decode()
-		return re.findall(r'^(\w+).*?\n\s+inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)', output, re.MULTILINE | re.DOTALL)
+		return re.findall(r'^(\w+).*?\n\s+inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)', output, re.MULTILINE)
 
 	@property
 	def list(self):
@@ -677,17 +679,17 @@ def stdout(data, record=True):
 		core.output_line_buffer << data
 
 def ask(text):
-	try:
+	while True:
 		try:
 			return input(f"{paint(f'[?] {text}').yellow}")
 
 		except EOFError:
 			print()
-			return ask(text)
+			continue
 
-	except KeyboardInterrupt:
-		print("^C")
-		return ' '
+		except KeyboardInterrupt:
+			print("^C")
+			return ' '
 
 def my_input(text="", histfile=None, histlen=None, completer=lambda text, state: None, completer_delims=None):
 	if threading.current_thread().name == 'MainThread':
@@ -794,7 +796,7 @@ class BetterCMD:
 			index = line[1:].strip()
 			hist_len = readline.get_current_history_length()
 
-			if not index.isnumeric() or not (0 < int(index) < hist_len):
+			if not index.isnumeric() or not (0 < int(index) <= hist_len):
 				cmdlogger.error("Invalid command number")
 				readline.remove_history_item(hist_len - 1)
 				return None, None, line
@@ -949,9 +951,9 @@ class MainMenu(BetterCMD):
 
 	@staticmethod
 	def get_core_id_completion(text, *extra, attr='sessions'):
-		options = list(map(str, getattr(core, attr)))
-		options.extend(extra)
-		return [option for option in options if option.startswith(text)]
+		choices = list(map(str, getattr(core, attr)))
+		choices.extend(extra)
+		return [choice for choice in choices if choice.startswith(text)]
 
 	def set_id(self, ID):
 		self.sid = ID
@@ -1167,6 +1169,8 @@ class MainMenu(BetterCMD):
 						self.onecmd("maintain")
 					for session in reversed(list(core.sessions.copy().values())):
 						session.kill()
+				else:
+					return False
 		else:
 			core.sessions[ID].kill()
 
@@ -1204,6 +1208,8 @@ class MainMenu(BetterCMD):
 			lhost = "127.0.0.1"
 
 			if group2:
+				rhost = None
+				rport = None
 				match = re.search(r"((?:[^\s]*)?):((?:[^\s]*)?)", group2)
 				if match:
 					rhost = match.group(1)
@@ -1231,13 +1237,21 @@ class MainMenu(BetterCMD):
 			rport = None
 
 			if group2:
-				rhost, rport = group2.split(':')
+				parts = group2.split(':')
+				if len(parts) != 2:
+					cmdlogger.warning("Invalid syntax. Use host:port")
+					return False
+				rhost, rport = parts
 			else:
 				cmdlogger.warning("Remote endpoint is required for reverse forwarding")
 				return False
 
 			if group1:
-				lhost, lport = group1.split(':')
+				parts = group1.split(':')
+				if len(parts) != 2:
+					cmdlogger.warning("Invalid syntax. Use host:port")
+					return False
+				lhost, lport = parts
 			else:
 				cmdlogger.warning("At least local port is required")
 				return False
@@ -1477,7 +1491,12 @@ class MainMenu(BetterCMD):
 		[SessionID]
 		Open the session's local folder. If no session specified, open the base folder
 		"""
-		folder = core.sessions[self.sid].directory if self.sid else options.basedir
+		if ID and int(ID) in core.sessions:
+			folder = core.sessions[int(ID)].directory
+		elif self.sid and self.sid in core.sessions:
+			folder = core.sessions[self.sid].directory
+		else:
+			folder = options.basedir
 		Open(folder)
 		print(folder)
 
@@ -1765,10 +1784,14 @@ class MainMenu(BetterCMD):
 		return __class__.file_completer(text)
 
 	def complete_download(self, text, line, begidx, endidx):
-		return core.sessions[self.sid].get_remote_completion(text)
+		if self.sid and self.sid in core.sessions:
+			return core.sessions[self.sid].get_remote_completion(text)
+		return []
 
 	def complete_open(self, text, line, begidx, endidx):
-		return core.sessions[self.sid].get_remote_completion(text)
+		if self.sid and self.sid in core.sessions:
+			return core.sessions[self.sid].get_remote_completion(text)
+		return []
 
 	def complete_use(self, text, line, begidx, endidx):
 		return self.get_core_id_completion(text, "none")
@@ -1814,7 +1837,14 @@ class ControlQueue:
 				amount += 1
 			except queue.Empty:
 				break
-		os.read(self._out, amount) # maybe needs 'try' because sometimes close() precedes
+		if amount:
+			try:
+				os.set_blocking(self._out, False)
+				os.read(self._out, amount)
+			except BlockingIOError:
+				pass
+			finally:
+				os.set_blocking(self._out, True)
 
 	def close(self):
 		os.close(self._in)
@@ -2003,10 +2033,10 @@ class Core:
 
 							readable.record(shell_output)
 
-							if b'\x1b[?1049h' in data:
+							if b'\x1b[?1049h' in shell_output:
 								readable.alternate_buffer = True
 
-							if b'\x1b[?1049l' in data:
+							if b'\x1b[?1049l' in shell_output:
 								readable.alternate_buffer = False
 
 							readable.shell_response_buf.seek(0)
@@ -2304,7 +2334,7 @@ class TmuxBridge:
 
 	def __init__(self, session):
 		self.session = session
-		self.socket_path = f"/tmp/.penelope_bridge_{session.id}_{os.getpid()}"
+		self.socket_path = tempfile.mktemp(prefix=f'.penelope_bridge_{session.id}_', dir='/tmp')
 		self.pane_id = None
 		self.client_sock = None
 
@@ -2319,7 +2349,7 @@ class TmuxBridge:
 		self.server_sock.listen(1)
 
 		# Write bridge client script to temp file
-		self.script_path = f"/tmp/.penelope_pane_{session.id}.py"
+		self.script_path = tempfile.mktemp(prefix=f'.penelope_pane_{session.id}_', suffix='.py', dir='/tmp')
 		with open(self.script_path, 'w') as f:
 			f.write(TMUX_BRIDGE_CLIENT)
 
@@ -2333,6 +2363,7 @@ class TmuxBridge:
 		result = subprocess.run(split_cmd, capture_output=True, text=True)
 		if result.returncode != 0:
 			logger.error(f"Failed to create tmux pane: {result.stderr.strip()}")
+			self.server_sock.close()
 			self._cleanup_files()
 			return
 
@@ -2442,6 +2473,9 @@ class TmuxBridge:
 			except OSError: pass
 
 	def close(self, notify=False):
+		if getattr(self, '_closed', False):
+			return
+		self._closed = True
 		session_id = self.session.id
 		self.session.tmux_bridge = None
 		if self in core.rlist:
@@ -2473,6 +2507,7 @@ class Session:
 				self.ip = _socket.getpeername()[0]
 			except:
 				logger.error(f"Invalid connection from {self.target} {EMOJIS['invalid_shell']}")
+				_socket.close()
 				return
 			self._host, self._port = self.socket.getsockname()
 			self.listener = listener
@@ -2708,7 +2743,7 @@ class Session:
 					except:
 						self._can_deploy_agent = False
 						return self._can_deploy_agent
-					self.remote_python_version = (int(major), int(minor), int(micro))
+					self.remote_python_version = (int(major), int(minor), int(micro or 0))
 					if self.remote_python_version >= (2, 3): # Python 2.2 lacks: tarfile, os.walk, yield
 						self._can_deploy_agent = True
 					else:
@@ -2834,7 +2869,7 @@ class Session:
 
 			elif self.OS == 'Windows':
 				write_test_file = rand(16)
-				cmd = f'type nul > {write_test_file}.tmp 2>nul && (echo OK) || (echo NO) & del {write_test_file}.tmp 2>nul'
+				cmd = f'cd /d "{directory}" && type nul > {write_test_file}.tmp 2>nul && (echo OK) || (echo NO) & del {write_test_file}.tmp 2>nul'
 				response = self.exec(cmd, force_cmd=True, value=True)
 				if response == "NO":
 					logger.error(f"{directory}: Access is denied.")
@@ -3202,6 +3237,7 @@ class Session:
 								break
 
 						if readable is stdin_src:
+							data = b''
 							if hasattr(stdin_src, 'read'): # FIX
 								data = stdin_src.read(options.network_buffer_size)
 							elif hasattr(stdin_src, 'recv'):
@@ -3453,38 +3489,37 @@ class Session:
 			return self.subchannel.result
 
 	def need_binary(self, name, url):
-		menu_text = (
-			f"\n  1) Upload {paint(url).blue}{paint().magenta}"
-			f"\n  2) Upload local {name} binary"
-			f"\n  3) Specify remote {name} binary path"
-			 "\n  4) None of the above\n"
-		)
-		print(paint(menu_text).magenta)
-		answer = ask("Select action: ")
+		while True:
+			menu_text = (
+				f"\n  1) Upload {paint(url).blue}{paint().magenta}"
+				f"\n  2) Upload local {name} binary"
+				f"\n  3) Specify remote {name} binary path"
+				 "\n  4) None of the above\n"
+			)
+			print(paint(menu_text).magenta)
+			answer = ask("Select action: ")
 
-		if answer == "1":
-			return self.upload(url, remote_path="/var/tmp")[0]
+			if answer == "1":
+				return self.upload(url, remote_path="/var/tmp")[0]
 
-		elif answer == "2":
-			local_path = ask(f"Enter {name} local path: ")
-			if local_path:
-				if os.path.exists(local_path):
-					return self.upload(local_path, remote_path=self.tmp)[0]
-				else:
-					logger.error("The local path does not exist...")
+			elif answer == "2":
+				local_path = ask(f"Enter {name} local path: ")
+				if local_path:
+					if os.path.exists(local_path):
+						return self.upload(local_path, remote_path=self.tmp)[0]
+					else:
+						logger.error("The local path does not exist...")
 
-		elif answer == "3":
-			remote_path = ask(f"Enter {name} remote path: ")
-			if remote_path:
-				if not self.exec(f"test -f {remote_path} || echo x"):
-					return remote_path
-				else:
-					logger.error("The remote path does not exist...")
+			elif answer == "3":
+				remote_path = ask(f"Enter {name} remote path: ")
+				if remote_path:
+					if not self.exec(f"test -f {remote_path} || echo x"):
+						return remote_path
+					else:
+						logger.error("The remote path does not exist...")
 
-		elif answer == "4":
-			return False
-
-		return self.need_binary(name, url)
+			elif answer == "4":
+				return False
 
 	def upgrade(self):
 		self.upgrade_attempted = True
@@ -3502,6 +3537,7 @@ class Session:
 					logger.info("Attempting to deploy Python Agent...")
 				else:
 					logger.warning("This shell is already PTY")
+					return True
 			else:
 				logger.info("Attempting to upgrade shell to PTY...")
 
@@ -3720,7 +3756,7 @@ class Session:
 	def sync_cwd(self):
 		self._cwd = None
 		if self.agent:
-			self.exec(f"os.chdir('{self.cwd}')", python=True, value=True)
+			self.exec("os.chdir({})".format(repr(self.cwd)), python=True, value=True)
 		elif self.need_control_session:
 			self.exec(f"cd {self.cwd}")
 
@@ -3831,8 +3867,8 @@ class Session:
 				stdout_stream = self.new_streamID
 				stderr_stream = self.new_streamID
 
-				if not all([stdout_stream, stderr_stream]):
-					return
+				if not all([stdin_stream, stdout_stream, stderr_stream]):
+					return []
 
 				code = fr"""
 				from glob import glob
@@ -4126,8 +4162,8 @@ class Session:
 				stdout_stream = self.new_streamID
 				stderr_stream = self.new_streamID
 
-				if not all([stdin_stream, stderr_stream]):
-					return
+				if not all([stdin_stream, stdout_stream, stderr_stream]):
+					return []
 
 				code = rf"""
 				import tarfile
@@ -4224,7 +4260,7 @@ class Session:
 					#progress_bar.update(len(chunk))
 
 				#logger.info(paint("--- Remote unpacking...").blue)
-				dest = f"-C {remote_path}" if remote_path else ""
+				dest = f"-C {shlex.quote(remote_path)}" if remote_path else ""
 				cmd = f"base64 -d < {temp} | tar xz {dest} 2>&1; temp=$?"
 				response = self.exec(cmd, value=True)
 				exit_code = int(self.exec("echo $temp", value=True))
@@ -4376,6 +4412,7 @@ class Session:
 					return False
 			except Exception as e:
 				logger.error(e)
+				return False
 
 			local_script = local_script_folder / (prefix + filename)
 			with open(local_script, "wb") as input_file:
@@ -4418,7 +4455,7 @@ class Session:
 		if self.OS == "Unix":
 			if any([self.listener, port, host]):
 
-				if self.listener.jump:
+				if self.listener and self.listener.jump:
 					if len(self.listener.jump) == 1:
 						host, port = self.listener.jump[0]
 					else:
@@ -4616,6 +4653,9 @@ class Session:
 			core.control << f'self.sessions[{self.id}].kill()'
 			return
 
+		if self.is_attached:
+			self.detach()
+
 		self.subchannel.control.close()
 		self.subchannel.close()
 
@@ -4647,9 +4687,6 @@ class Session:
 
 		if hasattr(self, 'logfile'):
 			self.logfile.close()
-
-		if self.is_attached:
-			self.detach()
 
 		for portfwd in self.tasks['portfwd']:
 			info, control, stop, thread, server = portfwd
@@ -4699,7 +4736,7 @@ class Messenger:
 		self.input_buffer.seek(0)
 
 		while True:
-			if not self.len:
+			if self.len is None:
 				len_need = Messenger.LEN_BYTES - self.length_buffer.tell()
 				data = self.input_buffer.read(len_need)
 				self.length_buffer.write(data)
@@ -5413,7 +5450,7 @@ class meterpreter(Module):
 		if session.OS == 'Unix':
 			logger.error("This module runs only on Windows shells")
 		else:
-			payload_path = f"/dev/shm/{rand(10)}.exe"
+			payload_path = os.path.join(tempfile.gettempdir(), f"{rand(10)}.exe")
 			host = session._host
 			port = 5555
 			arch = ''
@@ -5509,8 +5546,9 @@ class FileServer:
 
 	def add(self, item):
 		if item == '/':
-			self.filemap[f'/{self.url_prefix}[root]'] = '/'
-			return '/[root]'
+			urlpath = f'/{self.url_prefix}[root]'
+			self.filemap[urlpath] = '/'
+			return urlpath
 
 		item = os.path.abspath(normalize_path(item))
 
@@ -5533,8 +5571,13 @@ class FileServer:
 
 	def remove(self, item):
 		item = os.path.abspath(normalize_path(item))
-		if item in self.filemap:
-			del self.filemap[f"/{os.path.basename(item)}"]
+		key_to_del = None
+		for key, value in self.filemap.items():
+			if value == item:
+				key_to_del = key
+				break
+		if key_to_del is not None:
+			del self.filemap[key_to_del]
 		else:
 			if not self.quiet:
 				logger.warning(f"{item} is not served.")
@@ -5595,9 +5638,11 @@ class FileServer:
 			def do_GET(self):
 				try:
 					if self.path == '/' + url_prefix:
+						from html import escape as html_escape
 						response = ''
 						for path in filemap.keys():
-							response += f'<li><a href="{path}">{path}</a></li>'
+							safe_path = html_escape(path, quote=True)
+							response += f'<li><a href="{safe_path}">{safe_path}</a></li>'
 						response = response.encode()
 						self.send_response(200)
 						self.send_header("Content-type", "text/html")
@@ -5632,7 +5677,7 @@ class FileServer:
 					return None
 				message = format % args
 				response = message.translate(self._control_char_table).split(' ')
-				if not response[0].startswith('"'):
+				if len(response) < 4 or not response[0].startswith('"'):
 					return
 				if response[3][0] == '3':
 					color = 'yellow'
@@ -5806,7 +5851,7 @@ def listener_menu():
 		return False
 
 	listener_menu.active = True
-	func = lambda: _
+	func = lambda: None
 	listener_menu.control_r, listener_menu.control_w = os.pipe()
 
 	listener_menu.finishing = threading.Event()
@@ -5862,7 +5907,8 @@ def load_rc():
 			exec(rc.read(), globals())
 	except FileNotFoundError:
 		RC.touch(mode=0o600)
-	except Exception:
+	except Exception as e:
+		logger.warning(f"Error loading RC file ({RC}): {e}")
 		os.chmod(RC, 0o600)
 
 def emojis_installed():
@@ -5981,7 +6027,7 @@ class Options:
 
 		if hasattr(self, option) and getattr(self, option) is not None:
 			new_value_type = type(value).__name__
-			orig_value_type = type(getattr(self, option)).__name__
+			orig_value_type = type(self.__dict__.get(option, getattr(self, option))).__name__
 			if new_value_type == orig_value_type:
 				self.__dict__[option] = value
 			else:
