@@ -13,6 +13,7 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 ## Table of Contents
 - [Fork Changes](#fork-changes)
   - [Exegol + tmux Integration](#exegol--tmux-integration)
+  - [tmux Auto-Split](#tmux-auto-split)
   - [Windows Improvements](#windows-improvements)
   - [Security Hardening](#security-hardening)
   - [Bug Fixes](#bug-fixes)
@@ -34,6 +35,39 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 
 - `Open(..., terminal=True)` prefers `tmux split-window -h` when `$TMUX` is set, with terminal-emulator fallback outside tmux.
 - `meterpreter` module uses explicit Exegol Metasploit paths (`bundle exec ... msfvenom/msfconsole`) instead of relying on `$PATH`.
+
+## tmux Auto-Split
+
+The flagship feature of this fork. When `--auto-split` (`-A`) is enabled inside tmux, each incoming reverse shell automatically gets its own tmux pane — no manual `interact` required.
+
+```
+┌─────────────────────┬─────────────────────┬─────────────────────┐
+│ penelope menu        │ Session 1 (PTY)     │ Session 2 (PTY)     │
+│                      │ root@target1 #      │ www-data@target2 $  │
+│ [+] Got shell...     │                     │                     │
+│ [+] Got shell...     │                     │                     │
+│ ➤ Main Menu          │                     │                     │
+└─────────────────────┴─────────────────────┴─────────────────────┘
+```
+
+**How it works:** Each session gets a Unix domain socket bridge. A lightweight bridge client runs in the new tmux pane and proxies raw terminal I/O to/from the main penelope process over the socket. The shell is upgraded to PTY before the pane opens, so you get a clean prompt immediately.
+
+**Usage:**
+```bash
+# Inside tmux
+penelope -p 4444 --auto-split
+
+# Or enable at runtime from the menu
+SET auto_split True
+```
+
+**Behavior:**
+- Each new session opens a horizontal split (`-h`) without stealing focus from the menu pane
+- `interact <id>` on a bridged session focuses its tmux pane instead of attaching inline
+- `kill <id>` closes the session and its tmux pane, cleans up the bridge socket
+- Closing a pane manually (Ctrl+D / `exit`) cleans up the bridge; the session survives and can be `interact`-ed normally from the menu
+- Works with PTY-upgraded shells, agent-deployed shells, and raw shells
+- Rearrange panes with standard tmux keybindings (Ctrl+B arrow keys, etc.)
 
 ## Windows Improvements
 
@@ -107,6 +141,7 @@ pipx install penelope-shell-handler
 |Local port forwarding|✅|❌|❌|
 |Spawn shells on multiple tabs and/or hosts|✅|✅|❌|
 |Maintain X amount of active shells per host no matter what|✅|✅|❌|
+|Auto-split tmux panes on new sessions (-A)|✅|✅|✅|
 
 (*) opens a second TCP connection
 
@@ -136,6 +171,8 @@ penelope -p 5555                  # Listening for reverse shells on 0.0.0.0:5555
 penelope -p 4444,5555             # Listening for reverse shells on 0.0.0.0:4444 and 0.0.0.0:5555
 penelope -i eth0 -p 5555          # Listening for reverse shells on eth0:5555
 penelope -a                       # Listening for reverse shells on 0.0.0.0:4444 and show sample reverse shell payloads
+
+penelope -p 4444 -A               # Listening on 4444, auto-split tmux pane per session
 
 penelope -c target -p 3333        # Connect to a bind shell on target:3333
 
@@ -197,6 +234,7 @@ Misc:
   -m , --maintain               Keep N sessions per target
   -M, --menu                    Start in the Main Menu.
   -S, --single-session          Accommodate only the first created session
+  -A, --auto-split              Auto-split tmux pane on new sessions
   -C, --no-attach               Do not auto-attach on new sessions
   -U, --no-upgrade              Disable shell auto-upgrade
   -O, --oscp-safe               Enable OSCP-safe mode

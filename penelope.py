@@ -79,6 +79,30 @@ chunks = lambda string, length: (string[0 + i:length + i] for i in range(0, len(
 pathlink = lambda path: f'\x1b]8;;file://{path.parents[0]}\x07{path.parents[0]}{os.path.sep}\x1b]8;;\x07\x1b]8;;file://{path}\x07{path.name}\x1b]8;;\x07'
 normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
 
+TMUX_BRIDGE_CLIENT = dedent('''\
+	import socket, os, sys, tty, termios, select, signal
+	sock = socket.socket(socket.AF_UNIX)
+	sock.connect(sys.argv[1])
+	old = termios.tcgetattr(sys.stdin.fileno())
+	tty.setraw(sys.stdin.fileno())
+	try:
+		while True:
+			r, _, _ = select.select([sys.stdin, sock], [], [])
+			if sys.stdin in r:
+				data = os.read(sys.stdin.fileno(), 16384)
+				if not data: break
+				sock.sendall(data)
+			if sock in r:
+				data = sock.recv(16384)
+				if not data: break
+				os.write(sys.stdout.fileno(), data)
+	except (BrokenPipeError, ConnectionResetError, OSError):
+		pass
+	finally:
+		termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+		sock.close()
+''')
+
 def safe_tar_extractall(tar, dest):
 	dest_real = os.path.realpath(dest)
 	for member in tar.getmembers():
@@ -1781,6 +1805,25 @@ class Core:
 					else:
 						logger.error("You shouldn't see this error; Please report it")
 
+				# tmux bridge input
+				elif readable.__class__ is TmuxBridge:
+					try:
+						data = readable.recv(options.network_buffer_size)
+						if not data:
+							raise OSError
+					except OSError:
+						readable.close()
+						break
+
+					session = readable.session
+					if session.type == 'Raw':
+						session.record(data, _input=not session.interactive)
+
+					if session.agent:
+						data = Messenger.message(Messenger.SHELL, data)
+
+					session.send(data, stdin=True)
+
 				# The sessions
 				elif readable.__class__ is Session:
 					try:
@@ -1820,7 +1863,9 @@ class Core:
 
 						shell_output = readable.shell_response_buf.getvalue()
 						if shell_output:
-							if readable.is_attached:
+							if readable.tmux_bridge:
+								readable.tmux_bridge.send(shell_output)
+							elif readable.is_attached:
 								stdout(shell_output)
 
 							readable.record(shell_output)
@@ -2107,6 +2152,87 @@ class Channel:
 		os.close(self._read)
 		os.close(self._write)
 
+class TmuxBridge:
+
+	def __init__(self, session):
+		self.session = session
+		self.socket_path = f"/tmp/.penelope_bridge_{session.id}_{os.getpid()}"
+		self.pane_id = None
+		self.client_sock = None
+
+		# Create Unix domain socket server
+		self.server_sock = socket.socket(socket.AF_UNIX)
+		try:
+			self.server_sock.bind(self.socket_path)
+		except OSError:
+			try: os.unlink(self.socket_path)
+			except OSError: pass
+			self.server_sock.bind(self.socket_path)
+		self.server_sock.listen(1)
+
+		# Write bridge client script to temp file
+		self.script_path = f"/tmp/.penelope_pane_{session.id}.py"
+		with open(self.script_path, 'w') as f:
+			f.write(TMUX_BRIDGE_CLIENT)
+
+		# Open tmux pane
+		result = subprocess.run(
+			['tmux', 'split-window', '-h', '-d', '-P', '-F', '#{pane_id}',
+			 f'python3 {self.script_path} {self.socket_path}; rm -f {self.script_path}'],
+			capture_output=True, text=True
+		)
+		if result.returncode != 0:
+			logger.error(f"Failed to create tmux pane: {result.stderr.strip()}")
+			self._cleanup_files()
+			return
+
+		self.pane_id = result.stdout.strip()
+
+		# Accept connection from bridge client (with timeout)
+		self.server_sock.settimeout(5)
+		try:
+			self.client_sock, _ = self.server_sock.accept()
+			self.client_sock.setblocking(False)
+		except socket.timeout:
+			logger.error("tmux bridge client did not connect")
+			self.close()
+			return
+
+		# Register with Core loop
+		core.rlist.append(self)
+		core.control << ""
+
+	def fileno(self):
+		return self.client_sock.fileno()
+
+	def send(self, data):
+		try:
+			self.client_sock.sendall(data)
+		except (BrokenPipeError, OSError):
+			self.close()
+
+	def recv(self, size):
+		return self.client_sock.recv(size)
+
+	def _cleanup_files(self):
+		for p in (self.socket_path, getattr(self, 'script_path', '')):
+			try: os.unlink(p)
+			except OSError: pass
+
+	def close(self):
+		self.session.tmux_bridge = None
+		if self in core.rlist:
+			core.rlist.remove(self)
+		for s in (self.client_sock, self.server_sock):
+			if s:
+				try: s.close()
+				except OSError: pass
+		self._cleanup_files()
+		if self.pane_id:
+			subprocess.run(['tmux', 'kill-pane', '-t', self.pane_id],
+				capture_output=True)
+			self.pane_id = None
+
 class Session:
 
 	def __init__(self, _socket, target, port, listener=None):
@@ -2152,6 +2278,7 @@ class Session:
 			self.subchannel = Channel()
 			self.latency = None
 
+			self.tmux_bridge = None
 			self.alternate_buffer = False
 			self.agent = False
 			self.messenger = Messenger(io.BytesIO)
@@ -2240,6 +2367,35 @@ class Session:
 						module.run(self, None)
 
 				maintain_success = self.maintain()
+
+				# Auto-split tmux pane for this session
+				if options.auto_split and os.environ.get('TMUX'):
+					# First-attach setup before creating bridge
+					# (so upgrade terminal noise doesn't pollute the pane)
+					if self.new:
+						upgrade_conditions = [
+							not options.no_upgrade,
+							not (self.need_control_session and self.host_control_sessions == [self]),
+							not self.upgrade_attempted
+						]
+						if all(upgrade_conditions):
+							self.upgrade()
+						if self.prompt:
+							self.record(self.prompt)
+						self.new = False
+						for module in modules().values():
+							if module.enabled and module.on_first_attach:
+								module.run(self, None)
+
+					self.tmux_bridge = TmuxBridge(self)
+					if self.tmux_bridge and self.tmux_bridge.pane_id:
+						# Send a newline to trigger a fresh prompt from the shell
+						# (the original prompt was consumed during upgrade/exec)
+						data = b"\n"
+						if self.agent:
+							data = Messenger.message(Messenger.SHELL, data)
+						self.send(data, stdin=True)
+						return
 
 				if options.single_session and self.listener:
 					self.listener.stop()
@@ -3271,6 +3427,12 @@ class Session:
 
 	def attach(self):
 		if threading.current_thread().name != 'Core':
+			# If session is in a tmux pane, just focus it
+			if self.tmux_bridge and self.tmux_bridge.pane_id:
+				subprocess.run(['tmux', 'select-pane', '-t', self.tmux_bridge.pane_id],
+					capture_output=True)
+				return True
+
 			if self.new:
 				upgrade_conditions = [
 					not options.no_upgrade,
@@ -4237,6 +4399,9 @@ class Session:
 		except OSError:
 			pass
 		self.socket.close()
+
+		if self.tmux_bridge:
+			self.tmux_bridge.close()
 
 		if not self.OS:
 			message = f"Invalid shell from {self.ip} {EMOJIS['invalid_shell']}"
@@ -5529,6 +5694,7 @@ class Options:
 		self.useragent = "Wget/1.21.2"
 		self.upload_random_suffix = False
 		self.attach_lines = 20
+		self.auto_split = False
 
 	def __getattribute__(self, option):
 		if option in ("logfile", "debug_logfile", "cmd_histfile", "debug_histfile"):
@@ -5623,6 +5789,7 @@ def main():
 	misc.add_argument("-m", "--maintain", help="Keep N sessions per target", type=int, metavar='')
 	misc.add_argument("-M", "--menu", help="Start in the Main Menu.", action="store_true")
 	misc.add_argument("-S", "--single-session", help="Accommodate only the first created session", action="store_true")
+	misc.add_argument("-A", "--auto-split", help="Auto-split tmux pane on new sessions", action="store_true")
 	misc.add_argument("-C", "--no-attach", help="Do not auto-attach on new sessions", action="store_true")
 	misc.add_argument("-U", "--no-upgrade", help="Disable shell auto-upgrade", action="store_true")
 	misc.add_argument("-O", "--oscp-safe", help="Enable OSCP-safe mode", action="store_true")
