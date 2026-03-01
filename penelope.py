@@ -80,11 +80,20 @@ pathlink = lambda path: f'\x1b]8;;file://{path.parents[0]}\x07{path.parents[0]}{
 normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
 
 TMUX_BRIDGE_CLIENT = dedent('''\
-	import socket, os, sys, tty, termios, select, signal
+	import socket, os, sys, tty, termios, select, signal, struct
 	sock = socket.socket(socket.AF_UNIX)
 	sock.connect(sys.argv[1])
+	RESIZE_MAGIC = b'\\x00\\x00RESIZE'
+	def send_size(*_):
+		try:
+			sz = os.get_terminal_size()
+			sock.sendall(RESIZE_MAGIC + struct.pack('HH', sz.lines, sz.columns))
+		except (OSError, ValueError):
+			pass
+	signal.signal(signal.SIGWINCH, send_size)
 	old = termios.tcgetattr(sys.stdin.fileno())
 	tty.setraw(sys.stdin.fileno())
+	send_size()
 	try:
 		while True:
 			r, _, _ = select.select([sys.stdin, sock], [], [])
@@ -102,6 +111,9 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 		termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
 		sock.close()
 ''')
+
+RESIZE_MAGIC = b'\x00\x00RESIZE'
+RESIZE_MSG_LEN = 12  # 8-byte magic + 4-byte struct.pack('HH', lines, columns)
 
 def safe_tar_extractall(tar, dest):
 	dest_real = os.path.realpath(dest)
@@ -993,6 +1005,8 @@ class MainMenu(BetterCMD):
 								ID = paint('<' + str(session.id) + '>').yellow_BLINK
 						else:
 							ID = paint(' ' + str(session.id)).yellow
+						if getattr(session, 'tmux_bridge', None) and session.tmux_bridge.pane_id:
+							ID = str(ID) + str(paint('⊞').green)
 						source = session.listener or f'Connect({session._host}:{session.port})'
 						table += [
 							ID,
@@ -1815,6 +1829,10 @@ class Core:
 						readable.close()
 						break
 
+					data = readable.process_resize(data)
+					if not data:
+						break
+
 					session = readable.session
 					if session.type == 'Raw':
 						session.record(data, _input=not session.interactive)
@@ -2213,6 +2231,32 @@ class TmuxBridge:
 
 	def recv(self, size):
 		return self.client_sock.recv(size)
+
+	def process_resize(self, data):
+		"""Strip resize messages from data and forward dimensions to the remote PTY.
+		Returns remaining shell data."""
+		while RESIZE_MAGIC in data:
+			idx = data.index(RESIZE_MAGIC)
+			end = idx + RESIZE_MSG_LEN
+			if end > len(data):
+				break
+			lines, columns = struct.unpack('HH', data[idx + len(RESIZE_MAGIC):end])
+			self._forward_resize(lines, columns)
+			data = data[:idx] + data[end:]
+		return data
+
+	def _forward_resize(self, lines, columns):
+		"""Forward terminal dimensions to the remote PTY."""
+		session = self.session
+		if session.OS == 'Unix':
+			if session.agent:
+				session.send(Messenger.message(Messenger.RESIZE, struct.pack("HH", lines, columns)))
+			elif hasattr(session, 'tty') and session.tty:
+				threading.Thread(
+					target=session.exec,
+					args=(f"stty rows {lines} columns {columns} < {session.tty}",),
+					name="RESIZE"
+				).start()
 
 	def _cleanup_files(self):
 		for p in (self.socket_path, getattr(self, 'script_path', '')):
@@ -3429,6 +3473,7 @@ class Session:
 		if threading.current_thread().name != 'Core':
 			# If session is in a tmux pane, just focus it
 			if self.tmux_bridge and self.tmux_bridge.pane_id:
+				logger.info(f"Focusing tmux pane for session {self.id}")
 				subprocess.run(['tmux', 'select-pane', '-t', self.tmux_bridge.pane_id],
 					capture_output=True)
 				return True
