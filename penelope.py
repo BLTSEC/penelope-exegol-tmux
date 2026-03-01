@@ -85,6 +85,10 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 	sock.connect(sys.argv[1])
 	ESCAPE_SEQ = bytes.fromhex(sys.argv[2]) if len(sys.argv) > 2 else b'\\x1b[24~'
 	RESIZE_MAGIC = b'\\x00\\x00RESIZE'
+	CMD_MAGIC = b'\\x00\\x00CMD'
+	COMMAND_TRIGGER = b'\\x0f'
+	stdin_fd = sys.stdin.fileno()
+	stdout_fd = sys.stdout.fileno()
 	def send_size(*_):
 		try:
 			sz = os.get_terminal_size()
@@ -92,30 +96,134 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 		except (OSError, ValueError):
 			pass
 	signal.signal(signal.SIGWINCH, send_size)
-	old = termios.tcgetattr(sys.stdin.fileno())
-	tty.setraw(sys.stdin.fileno())
+	old = termios.tcgetattr(stdin_fd)
+	tty.setraw(stdin_fd)
 	send_size()
 	try:
 		while True:
 			r, _, _ = select.select([sys.stdin, sock], [], [])
 			if sys.stdin in r:
-				data = os.read(sys.stdin.fileno(), 16384)
+				data = os.read(stdin_fd, 16384)
 				if not data: break
 				if data == ESCAPE_SEQ: break
+				if data == COMMAND_TRIGGER:
+					termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old)
+					os.write(stdout_fd, b'\\r\\npenelope> ')
+					cmd = sys.stdin.readline().strip()
+					tty.setraw(stdin_fd)
+					if cmd:
+						payload = cmd.encode('utf-8')
+						sock.sendall(CMD_MAGIC + struct.pack('>H', len(payload)) + payload)
+					continue
 				sock.sendall(data)
 			if sock in r:
 				data = sock.recv(16384)
 				if not data: break
-				os.write(sys.stdout.fileno(), data)
+				os.write(stdout_fd, data)
 	except (BrokenPipeError, ConnectionResetError, OSError):
 		pass
 	finally:
-		termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+		termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old)
 		sock.close()
 ''')
 
 RESIZE_MAGIC = b'\x00\x00RESIZE'
 RESIZE_MSG_LEN = 12  # 8-byte magic + 4-byte struct.pack('HH', lines, columns)
+CMD_MAGIC = b'\x00\x00CMD'
+
+COMMAND_MODE_HELP = (
+	"Available commands:\n"
+	"  upload <file/glob>       Upload files to target\n"
+	"  download <path/glob>     Download files from target\n"
+	"  run <module> [args]      Run a penelope module\n"
+	"  spawn [port] [host]      Spawn a new session\n"
+	"  script <file>            Upload and execute a script\n"
+	"  help                     Show this help"
+)
+
+def dispatch_penelope_command(session, cmd_line, respond):
+	"""Parse and execute a penelope command for the given session.
+	respond(text) is called to send feedback to the user."""
+	parts = cmd_line.split(None, 1)
+	if not parts:
+		return
+	cmd = parts[0].lower()
+	args = parts[1] if len(parts) > 1 else ''
+
+	if cmd == 'help':
+		respond(COMMAND_MODE_HELP)
+		return
+
+	if cmd == 'upload':
+		if not args:
+			respond("Usage: upload <file/glob> [remote_path]")
+			return
+		try:
+			result = session.upload(args)
+			if result:
+				respond(f"Upload complete: {len(result)} item(s)")
+			else:
+				respond("Upload failed or no files matched")
+		except Exception as e:
+			respond(f"Upload error: {e}")
+
+	elif cmd == 'download':
+		if not args:
+			respond("Usage: download <path/glob>")
+			return
+		try:
+			result = session.download(args)
+			if result:
+				respond(f"Download complete: {len(result)} item(s)")
+			else:
+				respond("Download failed or no files matched")
+		except Exception as e:
+			respond(f"Download error: {e}")
+
+	elif cmd == 'run':
+		if not args:
+			respond("Usage: run <module> [args]")
+			return
+		mod_parts = args.split(None, 1)
+		mod_name = mod_parts[0]
+		mod_args = mod_parts[1] if len(mod_parts) > 1 else ''
+		module = modules().get(mod_name)
+		if not module:
+			respond(f"Unknown module: {mod_name}")
+			return
+		if not module.enabled:
+			respond(f"Module '{mod_name}' is disabled")
+			return
+		try:
+			module.run(session, mod_args)
+			respond(f"Module '{mod_name}' finished")
+		except Exception as e:
+			respond(f"Module error: {e}")
+
+	elif cmd == 'spawn':
+		try:
+			spawn_parts = args.split() if args else []
+			port = int(spawn_parts[0]) if spawn_parts else None
+			host = spawn_parts[1] if len(spawn_parts) > 1 else None
+			session.spawn(port=port, host=host)
+		except Exception as e:
+			respond(f"Spawn error: {e}")
+
+	elif cmd == 'script':
+		if not args:
+			respond("Usage: script <file>")
+			return
+		try:
+			result = session.script(args)
+			if result:
+				respond(f"Script output: {result}")
+			else:
+				respond("Script failed")
+		except Exception as e:
+			respond(f"Script error: {e}")
+
+	else:
+		respond(f"Unknown command: {cmd}. Type 'help' for available commands.")
 
 def safe_tar_extractall(tar, dest):
 	dest_real = os.path.realpath(dest)
@@ -1810,6 +1918,8 @@ class Core:
 								logger.error("(!) Exit the current alternate buffer program first")
 							else:
 								session.detach()
+						elif data == b'\x0f' and session.type == 'PTY':
+							self._command_mode(session)
 						else:
 							if session.type == 'Raw':
 								session.record(data, _input=not session.interactive)
@@ -1832,8 +1942,11 @@ class Core:
 						break
 
 					data = readable.process_resize(data)
+					data, commands = readable.process_command(data)
+					for cmd_line in commands:
+						readable.dispatch_command(cmd_line)
 					if not data:
-						break
+						continue
 
 					session = readable.session
 					if session.type == 'Raw':
@@ -1915,6 +2028,21 @@ class Core:
 					writable.outbuf.write(remaining)
 					if not remaining:
 						self.wlist.remove(writable)
+
+	def _command_mode(self, session):
+		"""Handle Ctrl+O command mode for regular (STDIN) sessions."""
+		termios.tcsetattr(sys.stdin, termios.TCSADRAIN, TTY_NORMAL)
+		try:
+			sys.stdout.write("\r\npenelope> ")
+			sys.stdout.flush()
+			cmd_line = sys.stdin.readline().strip()
+		except (EOFError, OSError):
+			cmd_line = ''
+		tty.setraw(sys.stdin)
+		if cmd_line:
+			def respond(msg):
+				stdout(f"\r\n{msg.replace(chr(10), chr(13)+chr(10))}\r\n".encode())
+			dispatch_penelope_command(session, cmd_line, respond)
 
 	def stop(self):
 		options.maintain = 0
@@ -2215,6 +2343,7 @@ class TmuxBridge:
 		try:
 			self.client_sock, _ = self.server_sock.accept()
 			self.client_sock.setblocking(False)
+			self.server_sock.close()
 		except socket.timeout:
 			logger.error("tmux bridge client did not connect")
 			self.close()
@@ -2274,6 +2403,38 @@ class TmuxBridge:
 					args=(f"stty rows {lines} columns {columns} < {session.tty}",),
 					name="RESIZE"
 				).start()
+
+	def process_command(self, data):
+		"""Strip command messages from data. Returns (remaining_data, commands_list)."""
+		commands = []
+		while CMD_MAGIC in data:
+			idx = data.index(CMD_MAGIC)
+			header_end = idx + len(CMD_MAGIC) + 2
+			if header_end > len(data):
+				break
+			payload_len = struct.unpack('>H', data[idx + len(CMD_MAGIC):header_end])[0]
+			msg_end = header_end + payload_len
+			if msg_end > len(data):
+				break
+			commands.append(data[header_end:msg_end].decode('utf-8', errors='replace'))
+			data = data[:idx] + data[msg_end:]
+		return data, commands
+
+	def send_message(self, text):
+		"""Send a feedback message to the bridge pane."""
+		self.send(f"\r\n{text.replace(chr(10), chr(13)+chr(10))}\r\n".encode())
+
+	def dispatch_command(self, cmd_line):
+		"""Parse and dispatch a penelope command from the bridge pane."""
+		threading.Thread(
+			target=self._dispatch_command_thread,
+			args=(cmd_line,),
+			name="BridgeCmd",
+			daemon=True
+		).start()
+
+	def _dispatch_command_thread(self, cmd_line):
+		dispatch_penelope_command(self.session, cmd_line, self.send_message)
 
 	def _cleanup_files(self):
 		for p in (self.socket_path, getattr(self, 'script_path', '')):
@@ -2452,6 +2613,8 @@ class Session:
 								module.run(self, None)
 
 					self.tmux_bridge = TmuxBridge(self)
+					if not self.tmux_bridge.pane_id:
+						self.tmux_bridge = None
 					if self.tmux_bridge and self.tmux_bridge.pane_id:
 						# Send a newline to trigger a fresh prompt from the shell
 						# (the original prompt was consumed during upgrade/exec)
@@ -3527,10 +3690,11 @@ class Session:
 		else:
 			escape_key = 'Ctrl-C'
 
+		cmd_hint = f"{paint(' • Commands').green} {paint('Ctrl-O').MAGENTA_white}" if self.type == 'PTY' else ''
 		logger.info(
 			f"Interacting with session {paint('[' + str(self.id) + ']').red}"
 			f"{paint(' • Shell Type').green} {paint(self.type).CYAN_white}{paint(' • Menu key').green} "
-			f"{paint(escape_key).MAGENTA_white} ⇐"
+			f"{paint(escape_key).MAGENTA_white}{cmd_hint} ⇐"
 		)
 
 		if not options.no_log:
