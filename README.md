@@ -42,11 +42,11 @@ The flagship feature of this fork. When `--auto-split` (`-A`) is enabled inside 
 
 ```
 ┌─────────────────────┬─────────────────────┬─────────────────────┐
-│ penelope menu        │ Session 1 (PTY)     │ Session 2 (PTY)     │
-│                      │ root@target1 #      │ www-data@target2 $  │
-│ [+] Got shell...     │                     │                     │
-│ [+] Got shell...     │                     │                     │
-│ ➤ Main Menu          │                     │                     │
+│ penelope menu       │ Session 1 (PTY)     │ Session 2 (PTY)     │
+│                     │ root@target1 #      │ www-data@target2 $  │
+│ [+] Got shell...    │                     │                     │
+│ [+] Got shell...    │                     │                     │
+│ ➤ Main Menu         │                     │                     │
 └─────────────────────┴─────────────────────┴─────────────────────┘
 ```
 
