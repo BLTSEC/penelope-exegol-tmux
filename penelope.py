@@ -83,6 +83,7 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 	import socket, os, sys, tty, termios, select, signal, struct
 	sock = socket.socket(socket.AF_UNIX)
 	sock.connect(sys.argv[1])
+	ESCAPE_SEQ = bytes.fromhex(sys.argv[2]) if len(sys.argv) > 2 else b'\\x1b[24~'
 	RESIZE_MAGIC = b'\\x00\\x00RESIZE'
 	def send_size(*_):
 		try:
@@ -100,6 +101,7 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 			if sys.stdin in r:
 				data = os.read(sys.stdin.fileno(), 16384)
 				if not data: break
+				if data == ESCAPE_SEQ: break
 				sock.sendall(data)
 			if sock in r:
 				data = sock.recv(16384)
@@ -1826,7 +1828,7 @@ class Core:
 						if not data:
 							raise OSError
 					except OSError:
-						readable.close()
+						readable.close(notify=True)
 						break
 
 					data = readable.process_resize(data)
@@ -2194,9 +2196,10 @@ class TmuxBridge:
 			f.write(TMUX_BRIDGE_CLIENT)
 
 		# Open tmux pane
+		escape_hex = options.escape['sequence'].hex()
 		result = subprocess.run(
 			['tmux', 'split-window', '-h', '-d', '-P', '-F', '#{pane_id}',
-			 f'python3 {self.script_path} {self.socket_path}; rm -f {self.script_path}'],
+			 f'python3 {self.script_path} {self.socket_path} {escape_hex}; rm -f {self.script_path}'],
 			capture_output=True, text=True
 		)
 		if result.returncode != 0:
@@ -2220,6 +2223,18 @@ class TmuxBridge:
 		core.rlist.append(self)
 		core.control << ""
 
+		# Rebalance to tiled layout when 3+ panes exist
+		try:
+			pane_count = subprocess.run(
+				['tmux', 'display-message', '-p', '#{window_panes}'],
+				capture_output=True, text=True, timeout=2
+			).stdout.strip()
+			if pane_count.isdigit() and int(pane_count) > 2:
+				subprocess.run(['tmux', 'select-layout', 'tiled'],
+					capture_output=True, timeout=2)
+		except (subprocess.TimeoutExpired, OSError):
+			pass
+
 	def fileno(self):
 		return self.client_sock.fileno()
 
@@ -2227,7 +2242,7 @@ class TmuxBridge:
 		try:
 			self.client_sock.sendall(data)
 		except (BrokenPipeError, OSError):
-			self.close()
+			self.close(notify=True)
 
 	def recv(self, size):
 		return self.client_sock.recv(size)
@@ -2263,7 +2278,8 @@ class TmuxBridge:
 			try: os.unlink(p)
 			except OSError: pass
 
-	def close(self):
+	def close(self, notify=False):
+		session_id = self.session.id
 		self.session.tmux_bridge = None
 		if self in core.rlist:
 			core.rlist.remove(self)
@@ -2276,6 +2292,8 @@ class TmuxBridge:
 			subprocess.run(['tmux', 'kill-pane', '-t', self.pane_id],
 				capture_output=True)
 			self.pane_id = None
+		if notify:
+			logger.warning(f"Bridge pane closed for session [{session_id}]")
 
 class Session:
 
