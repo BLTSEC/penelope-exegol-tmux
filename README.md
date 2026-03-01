@@ -15,6 +15,7 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
   - [Exegol + tmux Integration](#exegol--tmux-integration)
   - [tmux Auto-Split](#tmux-auto-split)
   - [Windows Improvements](#windows-improvements)
+  - [In-Session Command Mode](#in-session-command-mode-ctrlo)
   - [Security Hardening](#security-hardening)
   - [Bug Fixes](#bug-fixes)
 - [Install](#install)
@@ -69,6 +70,25 @@ SET auto_split True
 - Works with PTY-upgraded shells, agent-deployed shells, and raw shells
 - Rearrange panes with standard tmux keybindings (Ctrl+B arrow keys, etc.)
 
+## In-Session Command Mode (Ctrl+O)
+
+Run penelope commands without leaving your shell. Press `Ctrl+O` in any PTY session to open a `penelope>` prompt.
+
+```
+root@target:~#
+penelope> help
+Available commands:
+  upload <file/glob>       Upload files to target
+  download <path/glob>     Download files from target
+  run <module> [args]      Run a penelope module
+  spawn [port] [host]      Spawn a new session
+  script <file>            Upload and execute a script
+  help                     Show this help
+root@target:~#
+```
+
+Works in both regular attached sessions and tmux auto-split panes. The shell stays active while you run commands — no need to detach to the Main Menu.
+
 ## Windows Improvements
 
 - **Upload** is shell-aware (`psh`/`cmd`) and avoids `certutil`/`mshta`:
@@ -82,7 +102,7 @@ SET auto_split True
 
 ## Security Hardening
 
-Seven security vulnerabilities identified and fixed via code audit:
+12 security vulnerabilities identified and fixed:
 
 | ID | Vulnerability | Fix |
 |----|--------------|-----|
@@ -93,10 +113,15 @@ Seven security vulnerabilities identified and fixed via code audit:
 | S5 | **Shell injection** — `subprocess.run(shell=True)` in meterpreter module | Converted to argv list with `shell=False`, env dict, file redirect |
 | S6 | **`os.system()` calls** — command injection surface via `reset`/`clear` | Replaced with `subprocess.run(["reset"])` / `subprocess.run(["clear"])` |
 | S7 | **Port forwarding injection** — unvalidated rhost/rport interpolated into code | Hostname regex validation + port range (1-65535) enforcement |
+| S8 | **osascript command injection** — unescaped string interpolated into AppleScript | Escape `\` and `"` before interpolation |
+| S9 | **Predictable `/tmp` socket paths** — local symlink attack surface | Use `tempfile.mktemp()` for unpredictable names |
+| S10 | **Upload `remote_path` shell injection** — unquoted path in shell command | Wrapped with `shlex.quote()` |
+| S11 | **`sync_cwd` quote escape** — single quotes in paths break agent `os.chdir()` | Use `repr()` for proper Python string escaping |
+| S12 | **XSS in file server listing** — filenames rendered as raw HTML | HTML-escape paths with `html.escape()` |
 
 ## Bug Fixes
 
-Nine bugs identified and fixed:
+37 bugs identified and fixed across the full codebase:
 
 | ID | Bug | Fix |
 |----|-----|-----|
@@ -109,6 +134,34 @@ Nine bugs identified and fixed:
 | B7 | `do_portfwd()` uninitialized `rhost`/`rport` for reverse forwarding | Added defaults, required remote endpoint for `<-` |
 | B8 | `bdebug` lambda leaks file descriptors | Replaced with `def` using `with open()` context manager |
 | B9 | `eval()` in `write_access()` — unnecessary code execution risk | Replaced with string comparison `!= 'True'` |
+| B10 | `listener_menu()` crash on new connection — `lambda: _` references undefined `_` | Changed to `lambda: None` |
+| B11 | Alternate buffer detection checked wrong variable for agent sessions | Changed `data` to `shell_output` |
+| B12 | `spawn()` crashes with `AttributeError` when `self.listener` is `None` | Added null guard before `.jump` access |
+| B13 | `FileServer.remove()` never removes anything — checks keys instead of values | Rewrote to search values and delete matching key |
+| B14 | `upgrade()` unbound `cmd` when PTY ready but no agent | Early return when nothing to upgrade |
+| B15 | `Messenger.feed` treats length 0 as falsy — protocol desync | Changed `not self.len` to `self.len is None` |
+| B16 | `Session.__init__` leaks socket on `getpeername()` failure | Close socket before early return |
+| B17 | `TmuxBridge` leaks server socket on failed pane creation | Close server socket before early return |
+| B18 | `TmuxBridge.close()` can fire twice — double socket close | Added `_closed` flag guard |
+| B19 | `do_portfwd` `->` branch `UnboundLocalError` on missing colon | Initialize `rhost`/`rport` before regex |
+| B20 | `do_portfwd` `<-` branch `ValueError` on malformed input | Validate `split(':')` produces 2 parts |
+| B21 | `download`/`upload` incomplete stream null-checks and wrong return type | Check all 3 streams in `all()`, return `[]` not `None` |
+| B22 | `script()` missing return after URL download exception | Added `return False` |
+| B23 | `exec` `data` variable used without guaranteed assignment | Initialize `data = b''` |
+| B24 | `Options.__setattr__` type check rejects file path option changes | Use `self.__dict__` to bypass `__getattribute__` transform |
+| B25 | `ControlQueue.clear()` can block forever on pipe/queue race | Set pipe non-blocking for drain read |
+| B26 | `kill()` calls `detach()` after socket is already closed | Moved detach before socket teardown |
+| B27 | `CustomHandler.log_message` crashes on malformed HTTP requests | Added token count guard |
+| B28 | `ask()` infinite recursion on EOF | Converted to `while True` loop |
+| B29 | `need_binary` unbounded recursion on repeated invalid input | Converted to `while True` loop |
+| B30 | Python version `micro=None` silently disables agent deployment | Default to `int(micro or 0)` |
+| B31 | History recall off-by-one — last entry unreachable | Changed `<` to `<=` |
+| B32 | `do_dir` crashes with `KeyError` on stale/missing session | Added session existence guard |
+| B33 | Tab-completion crashes with `KeyError` when no session selected | Guard `self.sid` before indexing |
+| B34 | `do_kill` fallthrough after declining kill-all can trigger `core.stop()` | Return early on decline |
+| B35 | `get_core_id_completion` shadows global `options` | Renamed local to `choices` |
+| B36 | `ifconfig()` regex `DOTALL` causes cross-interface matching | Removed `re.DOTALL` flag |
+| B37 | Windows `write_access` tests wrong directory | Prepend `cd /d` to target the correct directory |
 
 ---
 
