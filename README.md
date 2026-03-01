@@ -16,6 +16,7 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
   - [tmux Auto-Split](#tmux-auto-split)
   - [Windows Improvements](#windows-improvements)
   - [In-Session Command Mode](#in-session-command-mode-ctrlo)
+  - [UX Improvements](#ux-improvements)
   - [Security Hardening](#security-hardening)
   - [Bug Fixes](#bug-fixes)
 - [Install](#install)
@@ -83,6 +84,9 @@ Available commands:
   run <module> [args]      Run a penelope module
   spawn [port] [host]      Spawn a new session
   script <file>            Upload and execute a script
+  sessions                 List active sessions
+  listeners                List active listeners
+  interfaces               Show network interfaces
   help                     Show this help
 root@target:~#
 ```
@@ -99,6 +103,21 @@ Works in both regular attached sessions and tmux auto-split panes. The shell sta
   - Uses begin/end markers for deterministic base64 extraction
   - Resolves relative paths against current remote CWD before archiving
 - **`write_access()`** temp-file probe uses proper f-string interpolation.
+
+## UX Improvements
+
+Quality-of-life changes to reduce friction during timed exams:
+
+- **`info` command** — `info [ID]` shows detailed session metadata (OS, arch, shell type, user, TTY, upload count, port forwards, log directory) without leaving the menu
+- **Ctrl+O in-session commands** — `sessions`, `listeners`, and `interfaces` added so you can check active sessions, listener ports, and attacker IPs without detaching from the shell
+- **Tab completion** — `exec` now completes remote paths, `script` completes local files
+- **`use N` feedback** — explicit confirmation message when selecting or deselecting sessions
+- **`SET` same-value feedback** — tells you when a value is already set instead of printing nothing
+- **`kill N` last-session warning** — prompts for confirmation when killing the last session to a host
+- **Better error messages** — `portfwd` shows syntax on empty input, PTY exec without control session explains what to do, `exec` no longer prints `None`/`False`
+- **PNPT-tuned defaults** — `latency` 0.05s, `short_timeout` 8s, `upload_chunk_size` 256KB for VPN-friendly operation
+- **Transfer progress bars** — download and upload paths show real-time progress with ETA
+- **Single-session auto-select** — commands auto-select the only active session without requiring `use`
 
 ## Security Hardening
 
@@ -121,7 +140,7 @@ Works in both regular attached sessions and tmux auto-split panes. The shell sta
 
 ## Bug Fixes
 
-37 bugs identified and fixed across the full codebase:
+80 bugs identified and fixed across multiple review passes (37 initial + 23 reliability + 20 final):
 
 | ID | Bug | Fix |
 |----|-----|-----|
@@ -162,6 +181,51 @@ Works in both regular attached sessions and tmux auto-split panes. The shell sta
 | B35 | `get_core_id_completion` shadows global `options` | Renamed local to `choices` |
 | B36 | `ifconfig()` regex `DOTALL` causes cross-interface matching | Removed `re.DOTALL` flag |
 | B37 | Windows `write_access` tests wrong directory | Prepend `cd /d` to target the correct directory |
+
+### Reliability Fixes (23)
+
+Focused on crash-prevention under real pentest conditions (flaky VPN, dying shells, partial transfers):
+
+| ID | Bug | Fix |
+|----|-----|-----|
+| R1 | `interrupt()` crashes on null `control_session` | Null-check before access |
+| R2 | `kill()` portfwd cleanup hangs on timeout | Added timeout + partial-task guard |
+| R3 | `int(exec())` crashes when exec returns `None`/`False` (4 sites) | Guard all download/upload `int()` casts |
+| R4 | `download`/`upload` crash when `self.tmp` is `False` | Added False guards |
+| R5 | `url_to_bytes` returns `None` — 8 module call sites crash | Null-check on all call sites |
+| R6 | `do_dir` crash on non-numeric session ID | Added `.isnumeric()` guard |
+| R7 | `do_open` set→list type error | Cast to list |
+| R8 | `du` output parsing crash on unexpected format | Added guard |
+| R9 | Download temp file not cleaned up on failure | Added cleanup in error path |
+| R10 | `Messenger.feed()` discards partial data on error | Preserve partial data |
+| R11 | Listener socket leak on bind failure | Close socket on error |
+| R12 | `write_access` `int()` crash on non-numeric exec result | Added guard |
+| R13-R17 | Stale closures in 5 module lambdas | Read data before `with`-block exit |
+
+### Final Review Fixes (20)
+
+| ID | Bug | Fix |
+|----|-----|-----|
+| F1 | `session_operation` stale `self.sid` causes `KeyError` on all `current=True` ops | Validate sid in `core.sessions`, warn and clear |
+| F2 | `get_user()` Windows crash when `whoami` returns `None` | Guard `response` before string operations |
+| F3 | `need_binary()` `IndexError` when upload fails (2 sites) | Check upload result before indexing |
+| F4 | `FileServer.stop()` crash when bind failed (no `self.id`) | Guard `hasattr(self, 'id')` |
+| F5 | ConPtyShell Windows upgrade `IndexError` on failed upload | Check upload result before indexing |
+| F6 | `Interfaces` crashes on `CalledProcessError` from `ip addr`/`ifconfig` | Wrapped in try/except |
+| F7 | `PBar.render_one()` `OSError` from `os.get_terminal_size()` | Fallback to fixed width |
+| F8 | `update_pty_size()` sends `stty ... < False` when TTY detection failed | Changed `else` to `elif self.tty` |
+| F9 | `Connect()` leaks socket on connection failure | Close socket in error paths |
+| F10 | `bin` property: truncated output breaks binary discovery permanently | Handle short output, use `.get()` |
+| F11 | `peass_ng` uses `False` as filepath + bare `assert` | Guard `script()` return, replace assert |
+| F12 | `script()` leaks file handles on no-shebang early return | Close both files before return |
+| F13 | `url_to_bytes` progress bar never terminated on success | Added `pbar.terminate()` after loop |
+| F14 | `upload_ad_scripts` GhostPack empty zip `IndexError` | Guard empty `iterdir()` |
+| F15 | `uac` module upload `IndexError` | Check upload result before indexing |
+| F16 | `PBar.eta` goes negative, renders as `-1 day, 23:59:57` | `max(0, ...)` |
+| F17 | Interface names include `@ifN` suffixes in containers | Regex strips `@suffix` |
+| F18 | `readline.get_line_buffer()` crash when readline unavailable | Guard `if readline` |
+| F19 | `single_session` exit check in `do_kill` unreachable | Fixed condition `== 1` → `not core.sessions` |
+| F20 | `bin` property bare `except: pass` swallows `KeyboardInterrupt` | Changed to `except Exception` with debug log |
 
 ---
 
