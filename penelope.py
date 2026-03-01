@@ -139,6 +139,9 @@ COMMAND_MODE_HELP = (
 	"  run <module> [args]      Run a penelope module\n"
 	"  spawn [port] [host]      Spawn a new session\n"
 	"  script <file>            Upload and execute a script\n"
+	"  sessions                 List active sessions\n"
+	"  listeners                List active listeners\n"
+	"  interfaces               Show network interfaces\n"
 	"  help                     Show this help"
 )
 
@@ -222,6 +225,38 @@ def dispatch_penelope_command(session, cmd_line, respond):
 				respond("Script failed")
 		except Exception as e:
 			respond(f"Script error: {e}")
+
+	elif cmd == 'sessions':
+		if not core.sessions:
+			respond("No active sessions")
+			return
+		lines = []
+		for sid, s in core.sessions.items():
+			marker = " <--" if s is session else ""
+			lines.append(f"  {sid:>3}  {s.type:<4}  {s.user or 'N/A':<12}  {s.name}{marker}")
+		respond("\n".join(lines))
+
+	elif cmd == 'listeners':
+		if not core.listeners:
+			respond("No active listeners")
+			return
+		lines = []
+		for lid, l in core.listeners.items():
+			lines.append(f"  {lid:>3}  {l.host}:{l.port}")
+		respond("\n".join(lines))
+
+	elif cmd == 'interfaces':
+		try:
+			ifaces = Interfaces().list
+			if not ifaces:
+				respond("No interfaces found")
+				return
+			lines = []
+			for name, ip in ifaces.items():
+				lines.append(f"  {name:<12}  {ip}")
+			respond("\n".join(lines))
+		except Exception as e:
+			respond(f"Error listing interfaces: {e}")
 
 	else:
 		respond(f"Unknown command: {cmd}. Type 'help' for available commands.")
@@ -932,7 +967,7 @@ class MainMenu(BetterCMD):
 		self.set_id(None)
 		self.commands = {
 			"Session Operations":['run', 'upload', 'download', 'open', 'maintain', 'spawn', 'upgrade', 'exec', 'script', 'portfwd'],
-			"Session Management":['sessions', 'use', 'interact', 'kill', 'dir|.'],
+			"Session Management":['sessions', 'use', 'interact', 'kill', 'info', 'dir|.'],
 			"Shell Management"  :['listeners', 'payloads', 'connect', 'Interfaces'],
 			"Miscellaneous"     :['help', 'modules', 'history', 'cd', 'reset', 'reload', 'SET', 'DEBUG', 'exit|quit|q|Ctrl+D']
 		}
@@ -1092,8 +1127,10 @@ class MainMenu(BetterCMD):
 		"""
 		if ID == 'none':
 			self.set_id(None)
+			cmdlogger.info("Deselected session")
 		else:
 			self.set_id(ID)
+			cmdlogger.info(f"Selected session {paint(ID).yellow}")
 
 	def do_sessions(self, line):
 		"""
@@ -1142,6 +1179,39 @@ class MainMenu(BetterCMD):
 				print()
 
 	@session_operation()
+	def do_info(self, ID):
+		"""
+		[SessionID]
+		Show detailed information about a session
+
+		Examples:
+
+			info		Show info for current session
+			info 1		Show info for SessionID 1
+		"""
+		session = core.sessions[ID]
+		fields = [
+			("ID",         str(session.id)),
+			("Host",       session.name),
+			("OS",         session.OS or 'N/A'),
+			("System",     session.system or 'N/A'),
+			("Arch",       session.arch or 'N/A'),
+			("Shell",      session.type),
+			("User",       session.user or 'N/A'),
+			("Agent",      str(session.agent)),
+			("Source",     str(session.listener or f'Connect({session._host}:{session.port})')),
+			("Remote",     f"{session.target}:{session.port}"),
+			("TTY",        session.tty or 'N/A'),
+			("Uploads",    str(len(session.uploaded_paths))),
+			("Port Fwds",  str(len(session.tasks.get('portfwd', [])))),
+			("Log Dir",    str(getattr(session, 'directory', 'N/A'))),
+		]
+		table = Table(joinchar=' : ')
+		for label, value in fields:
+			table += [paint(label).cyan, paint(value).yellow]
+		print('\n', indent(str(table), '  '), '\n', sep='')
+
+	@session_operation()
 	def do_interact(self, ID):
 		"""
 		[SessionID]
@@ -1181,7 +1251,11 @@ class MainMenu(BetterCMD):
 				else:
 					return False
 		else:
-			core.sessions[ID].kill()
+			session = core.sessions[ID]
+			if len(core.hosts.get(session.name, [])) <= 1:
+				if ask(f"Last session to {session.name}. Kill? (y/N): ").lower() != 'y':
+					return False
+			session.kill()
 
 		if options.single_session and len(core.sessions) == 1:
 			core.stop()
@@ -1200,7 +1274,7 @@ class MainMenu(BetterCMD):
 			0.0.0.0:8080 -> 192.168.0.1:80	Forward 0.0.0.0:8080 to 192.168.0.1:80
 		"""
 		if not line:
-			cmdlogger.warning("No parameters...")
+			cmdlogger.warning("Usage: portfwd host:port(<-|->)host:port")
 			return False
 
 		match = re.search(r"((?:.*)?)(<-|->)((?:.*)?)", line)
@@ -1532,7 +1606,8 @@ class MainMenu(BetterCMD):
 					timeout=None,
 					value=True
 				)
-				print(output)
+				if output is not None and output is not False:
+					print(output)
 		else:
 			cmdlogger.warning("No command to execute")
 
@@ -1741,6 +1816,8 @@ class MainMenu(BetterCMD):
 					setattr(options, param, new_value)
 					if getattr(options, param) != old_value:
 						cmdlogger.info(f"'{param}' option set to: {paint(getattr(options, param)).yellow}")
+					else:
+						cmdlogger.info(f"'{param}' is already: {paint(getattr(options, param)).yellow}")
 
 			except AttributeError:
 				cmdlogger.error("No such option")
@@ -1801,6 +1878,14 @@ class MainMenu(BetterCMD):
 		if self.sid and self.sid in core.sessions:
 			return core.sessions[self.sid].get_remote_completion(text)
 		return []
+
+	def complete_exec(self, text, line, begidx, endidx):
+		if self.sid and self.sid in core.sessions:
+			return core.sessions[self.sid].get_remote_completion(text)
+		return []
+
+	def complete_script(self, text, line, begidx, endidx):
+		return __class__.file_completer(text)
 
 	def complete_use(self, text, line, begidx, endidx):
 		return self.get_core_id_completion(text, "none")
@@ -3339,7 +3424,7 @@ class Session:
 					response = self.control_session.exec(**args)
 					return response
 				except AttributeError: # No control session
-					logger.error("Spawn MANUALLY a new shell for this session to operate properly")
+					logger.error("This PTY session needs a background shell to run commands. Use 'spawn' to create one")
 					return None
 
 			if not self or not self.subchannel.can_use:
