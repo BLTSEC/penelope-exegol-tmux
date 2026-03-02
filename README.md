@@ -47,9 +47,9 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
 The flagship feature of this fork. When `--auto-split` (`-A`) is enabled inside tmux, each incoming reverse shell automatically gets its own tmux pane — no manual `interact` required.
 
 ```
-┌─────────────────────┬─────────────────────┬─────────────────────┐
-│ penelope menu       │ Session 1 (PTY)     │ Session 2 (PTY)     │
-│                     │ root@target1 #      │ www-data@target2 $  │
+┌ penelope ───────────┬ [1] target1~10.10.. ┬ [2] target2~10.10.. ┐
+│ penelope menu       │ root@target1 #      │ www-data@target2 $  │
+│                     │                     │                     │
 │ [+] Got shell...    │                     │                     │
 │ [+] Got shell...    │                     │                     │
 │ ➤ Main Menu         │                     │                     │
@@ -73,6 +73,7 @@ SET auto_split True
 - `kill <id>` closes the session and its tmux pane, cleans up the bridge socket
 - Closing a pane manually (Ctrl+D / `exit`) cleans up the bridge; the session survives and can be `interact`-ed normally from the menu
 - Works with PTY-upgraded shells, agent-deployed shells, and raw shells
+- Pane borders show session identity (e.g. `[1] hostname~10.10.11.5-Linux-x86_64`) — requires `pane-border-status top` in tmux.conf
 - Rearrange panes with standard tmux keybindings (Ctrl+B arrow keys, etc.)
 
 ## In-Session Command Mode (Ctrl+O)

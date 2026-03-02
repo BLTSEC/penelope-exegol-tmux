@@ -2648,6 +2648,13 @@ class TmuxBridge:
 
 		self.pane_id = result.stdout.strip()
 
+		# Label the pane with session identity
+		pane_title = f"[{session.id}] {session.name}"
+		subprocess.run(
+			['tmux', 'select-pane', '-t', self.pane_id, '-T', pane_title],
+			capture_output=True, timeout=2
+		)
+
 		# Accept connection from bridge client (with timeout)
 		self.server_sock.settimeout(5)
 		try:
