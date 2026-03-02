@@ -832,6 +832,9 @@ class BetterCMD:
 		if not line:
 			return None, None, line
 		elif line[0] == '!':
+			if not readline:
+				cmdlogger.error("History recall requires readline support")
+				return None, None, line
 			index = line[1:].strip()
 			hist_len = readline.get_current_history_length()
 
@@ -4072,7 +4075,7 @@ class Session:
 				errors = [line[5:] for line in response.splitlines() if line.startswith('tar: /')]
 				for error in errors:
 					logger.error(error)
-				stat_response = self.exec(rf"(stat -x {temp} 2>/dev/null || stat {temp}) | sed -n 's/.*Size: \([0-9]*\).*/\1/p'")
+				stat_response = self.exec(rf"(stat -x {temp} 2>/dev/null || stat {temp}) | sed -n 's/.*Size: \([0-9]*\).*/\1/p'", value=True)
 				if not stat_response:
 					logger.error("Cannot determine archive size")
 					self.exec(f"rm {temp}")
@@ -6128,6 +6131,10 @@ def listener_menu():
 	stdout(b"\x1b[?25h\r")
 	func()
 	os.close(listener_menu.control_r)
+	try:
+		os.close(listener_menu.control_w)
+	except OSError:
+		pass
 	listener_menu.active = False
 	listener_menu.finishing.set()
 	return True
