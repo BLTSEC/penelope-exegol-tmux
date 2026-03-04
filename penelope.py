@@ -125,9 +125,6 @@ TMUX_BRIDGE_CLIENT = dedent('''\
 		sock.close()
 ''')
 
-RESIZE_MAGIC = b'\x00\x00RESIZE'
-RESIZE_MSG_LEN = 12  # 8-byte magic + 4-byte struct.pack('HH', lines, columns)
-CMD_MAGIC = b'\x00\x00CMD'
 
 COMMAND_MODE_HELP = (
 	"Available commands:\n"
@@ -140,8 +137,15 @@ COMMAND_MODE_HELP = (
 	"  listeners                List active listeners\n"
 	"  interfaces               Show network interfaces\n"
 	"  tasks                    Show background tasks\n"
+	"  detach                   Detach session and return to menu\n"
 	"  help                     Show this help"
 )
+
+COMMAND_MODE_COMMANDS = [
+	'upload', 'download', 'run', 'spawn', 'script',
+	'sessions', 'listeners', 'interfaces', 'tasks',
+	'detach', 'help', 'exit', 'quit', 'back',
+]
 
 def dispatch_penelope_command(session, cmd_line, respond):
 	"""Parse and execute a penelope command for the given session.
@@ -154,6 +158,10 @@ def dispatch_penelope_command(session, cmd_line, respond):
 
 	if cmd in ('exit', 'quit', 'q', 'back'):
 		return 'exit'
+
+	if cmd == 'detach':
+		session.detach()
+		return 'detach'
 
 	if cmd == 'help':
 		respond(COMMAND_MODE_HELP)
@@ -1291,6 +1299,10 @@ class MainMenu(BetterCMD):
 			interact	Interact with current session
 			interact 1	Interact with SessionID 1
 		"""
+		if ID not in core.sessions:
+			cmdlogger.error(f"Session [{ID}] no longer exists")
+			menu.set_id(None)
+			return
 		return core.sessions[ID].attach()
 
 	@session_operation(extra=['*'])
@@ -1917,7 +1929,7 @@ class MainMenu(BetterCMD):
 			core.stop()
 			for thread in threading.enumerate():
 				if thread.name == 'Core':
-					thread.join()
+					thread.join(timeout=3)
 			cmdlogger.info("Exited!")
 			remaining_threads = [thread for thread in threading.enumerate()]
 			if options.dev_mode and remaining_threads:
@@ -2164,7 +2176,7 @@ class Core:
 
 	def start(self):
 		self.started = True
-		threading.Thread(target=self.loop, name="Core").start()
+		threading.Thread(target=self.loop, name="Core", daemon=True).start()
 
 	def loop(self):
 
@@ -2331,12 +2343,6 @@ class Core:
 					if not remaining:
 						self.wlist.remove(writable)
 
-	_command_mode_commands = [
-		'upload', 'download', 'run', 'spawn', 'script',
-		'sessions', 'listeners', 'interfaces', 'tasks',
-		'help', 'exit', 'quit', 'back',
-	]
-
 	def _command_mode(self, session):
 		"""Handle Ctrl+O command mode in a separate thread so the Core loop
 		continues routing socket data (required for agent exec)."""
@@ -2344,7 +2350,7 @@ class Core:
 		def respond(msg):
 			print(f"\n{msg}")
 		def completer(text, state):
-			matches = [c for c in self._command_mode_commands if c.startswith(text)]
+			matches = [c for c in COMMAND_MODE_COMMANDS if c.startswith(text)]
 			return matches[state] if state < len(matches) else None
 		try:
 			print()
@@ -2353,10 +2359,12 @@ class Core:
 				if not cmd_line:
 					break
 				result = dispatch_penelope_command(session, cmd_line, respond)
-				if result == 'exit':
+				if result in ('exit', 'detach'):
 					break
 		except (EOFError, OSError, KeyboardInterrupt):
-			pass
+			result = None
+		if result == 'detach':
+			return
 		tty.setraw(sys.stdin)
 		stdout(b"\r\n")
 		# Send a newline to the remote shell to trigger a fresh prompt
@@ -2646,6 +2654,10 @@ class Channel:
 
 class TmuxBridge:
 
+	RESIZE_MAGIC = b'\x00\x00RESIZE'
+	RESIZE_MSG_LEN = 12  # 8-byte magic + 4-byte struct.pack('HH', lines, columns)
+	CMD_MAGIC = b'\x00\x00CMD'
+
 	def __init__(self, session):
 		self.session = session
 		self.socket_path = tempfile.mktemp(prefix=f'.penelope_bridge_{session.id}_', dir='/tmp')
@@ -2733,12 +2745,12 @@ class TmuxBridge:
 	def process_resize(self, data):
 		"""Strip resize messages from data and forward dimensions to the remote PTY.
 		Returns remaining shell data."""
-		while RESIZE_MAGIC in data:
-			idx = data.index(RESIZE_MAGIC)
-			end = idx + RESIZE_MSG_LEN
+		while self.RESIZE_MAGIC in data:
+			idx = data.index(self.RESIZE_MAGIC)
+			end = idx + self.RESIZE_MSG_LEN
 			if end > len(data):
 				break
-			lines, columns = struct.unpack('HH', data[idx + len(RESIZE_MAGIC):end])
+			lines, columns = struct.unpack('HH', data[idx + len(self.RESIZE_MAGIC):end])
 			self._forward_resize(lines, columns)
 			data = data[:idx] + data[end:]
 		return data
@@ -2759,12 +2771,12 @@ class TmuxBridge:
 	def process_command(self, data):
 		"""Strip command messages from data. Returns (remaining_data, commands_list)."""
 		commands = []
-		while CMD_MAGIC in data:
-			idx = data.index(CMD_MAGIC)
-			header_end = idx + len(CMD_MAGIC) + 2
+		while self.CMD_MAGIC in data:
+			idx = data.index(self.CMD_MAGIC)
+			header_end = idx + len(self.CMD_MAGIC) + 2
 			if header_end > len(data):
 				break
-			payload_len = struct.unpack('>H', data[idx + len(CMD_MAGIC):header_end])[0]
+			payload_len = struct.unpack('>H', data[idx + len(self.CMD_MAGIC):header_end])[0]
 			msg_end = header_end + payload_len
 			if msg_end > len(data):
 				break
@@ -2953,34 +2965,15 @@ class Session:
 
 				# Auto-split tmux pane for this session
 				if options.auto_split and os.environ.get('TMUX'):
-					# First-attach setup before creating bridge
-					# (so upgrade terminal noise doesn't pollute the pane)
-					if self.new:
-						upgrade_conditions = [
-							not options.no_upgrade,
-							not (self.need_control_session and self.host_control_sessions == [self]),
-							not self.upgrade_attempted
-						]
-						if all(upgrade_conditions):
-							self.upgrade()
-						if self.prompt:
-							self.record(self.prompt)
-						self.new = False
-						for module in modules().values():
-							if module.enabled and module.on_first_attach:
-								module.run(self, None)
-
+					self._first_attach_setup()
 					self.tmux_bridge = TmuxBridge(self)
-					if not self.tmux_bridge.pane_id:
-						self.tmux_bridge = None
 					if self.tmux_bridge and self.tmux_bridge.pane_id:
-						# Send a newline to trigger a fresh prompt from the shell
-						# (the original prompt was consumed during upgrade/exec)
 						data = b"\n"
 						if self.agent:
 							data = Messenger.message(Messenger.SHELL, data)
 						self.send(data, stdin=True)
 						return
+					self.tmux_bridge = None
 
 				if options.single_session and self.listener:
 					self.listener.stop()
@@ -3819,15 +3812,27 @@ class Session:
 					self.subchannel.result = re.sub(rb'\x1b\[(?:K|\?25h|25l|82X)', b'', self.subchannel.result)
 				self.subchannel.result = self.subchannel.result.strip().decode(errors="replace") # TODO check strip
 			logger.debug(f"{paint('FINAL RESPONSE: ').white_BLUE}{self.subchannel.result}")
-			with self.data_route_lock:
-				self.subchannel.active = False
+			if not separate:
+				with self.data_route_lock:
+					self.subchannel.active = False
 
-			if separate and self.subchannel.result:
-				self.subchannel.result = re.search(rb"..\x01.*", self.subchannel.result, re.DOTALL)[0]
-				buffer = io.BytesIO()
-				for _type, _value in self.messenger.feed(self.subchannel.result):
-					buffer.write(_value)
-				return buffer.getvalue()
+			if separate:
+				if self.subchannel.result:
+					self.subchannel.result = re.search(rb"..\x01.*", self.subchannel.result, re.DOTALL)[0]
+					buffer = io.BytesIO()
+					for _type, _value in self.messenger.feed(self.subchannel.result):
+						buffer.write(_value)
+					# Atomically enable agent mode and deactivate subchannel so the
+					# Core loop routes subsequent socket data through the TLV messenger.
+					# Without this, data arriving between subchannel deactivation and
+					# agent=True bypasses the messenger, corrupting the TLV stream.
+					with self.data_route_lock:
+						self.agent = True
+						self.subchannel.active = False
+					return buffer.getvalue()
+				else:
+					with self.data_route_lock:
+						self.subchannel.active = False
 
 			return self.subchannel.result
 
@@ -4037,6 +4042,23 @@ class Session:
 				if core.attached_session == self:
 					self.send(cmd.encode() + b"\n")
 
+	def _first_attach_setup(self):
+		if not self.new:
+			return
+		upgrade_conditions = [
+			not options.no_upgrade,
+			not (self.need_control_session and self.host_control_sessions == [self]),
+			not self.upgrade_attempted
+		]
+		if all(upgrade_conditions):
+			self.upgrade()
+		if self.prompt:
+			self.record(self.prompt)
+		self.new = False
+		for module in modules().values():
+			if module.enabled and module.on_first_attach:
+				module.run(self, None)
+
 	def attach(self):
 		if threading.current_thread().name != 'Core':
 			# If session is in a tmux pane, just focus it
@@ -4046,20 +4068,7 @@ class Session:
 					capture_output=True)
 				return True
 
-			if self.new:
-				upgrade_conditions = [
-					not options.no_upgrade,
-					not (self.need_control_session and self.host_control_sessions == [self]),
-					not self.upgrade_attempted
-				]
-				if all(upgrade_conditions):
-					self.upgrade()
-				if self.prompt:
-					self.record(self.prompt)
-				self.new = False
-				for module in modules().values():
-					if module.enabled and module.on_first_attach:
-						module.run(self, None)
+			self._first_attach_setup()
 
 			core.control << f'self.sessions[{self.id}].attach()'
 			menu.active.clear() # Redundant but safeguard
@@ -5042,8 +5051,6 @@ class Session:
 		if self not in core.rlist:
 			return True
 
-		if menu.sid == self.id:
-			menu.set_id(None)
 
 		thread_name = threading.current_thread().name
 		logger.debug(f"Thread <{thread_name}> wants to kill session {self.id}")
@@ -5098,6 +5105,8 @@ class Session:
 
 		if self.id in core.sessions:
 			del core.sessions[self.id]
+		if menu.sid == self.id:
+			menu.set_id(None)
 		logger.error(message)
 
 		if hasattr(self, 'logfile'):
@@ -6455,7 +6464,7 @@ class Options:
 		self.upload_chunk_size = 262144
 		self.download_chunk_size = 1048576
 		self.network_buffer_size = 16384
-		self.escape = {'sequence':b'\x1b[24~', 'key':'F12'}
+		self.escape = {'sequence':b'\x1d', 'key':'Ctrl-]'}
 		self.logfile = f"{__program__}.log"
 		self.debug_logfile = "debug.log"
 		self.cmd_histfile = 'cmd_history'
