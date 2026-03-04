@@ -4129,11 +4129,11 @@ class Session:
 			else:
 				self.subtype = 'cmd'
 
-	def detach(self):
-		if self and self.OS == 'Unix' and (self.agent or self.need_control_session):
+	def detach(self, dying=False):
+		if not dying and self and self.OS == 'Unix' and (self.agent or self.need_control_session):
 			threading.Thread(target=self.sync_cwd).start()
 
-		if self and self.OS == 'Windows' and self.type != 'PTY':
+		if not dying and self and self.OS == 'Windows' and self.type != 'PTY':
 			threading.Thread(target=self.get_subtype).start()
 
 		if threading.current_thread().name != 'Core':
@@ -5076,7 +5076,7 @@ class Session:
 			return
 
 		if self.is_attached:
-			self.detach()
+			self.detach(dying=True)
 
 		self.subchannel.control.close()
 		self.subchannel.close()

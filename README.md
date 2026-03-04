@@ -71,7 +71,7 @@ SET auto_split True
 - Each new session opens a horizontal split (`-h`) without stealing focus from the menu pane
 - `interact <id>` on a bridged session focuses its tmux pane instead of attaching inline
 - `kill <id>` closes the session and its tmux pane, cleans up the bridge socket
-- Closing a pane manually (Ctrl+D / `exit`) cleans up the bridge; the session survives and can be `interact`-ed normally from the menu
+- Closing a pane manually (`exit` / closing the pane) cleans up the bridge; the session survives and can be `interact`-ed normally from the menu
 - Works with PTY-upgraded shells, agent-deployed shells, and raw shells
 - Pane borders show session identity (e.g. `[1] hostname~10.10.11.5-Linux-x86_64`) — requires `pane-border-status top` in tmux.conf
 - Rearrange panes with standard tmux keybindings (Ctrl+B arrow keys, etc.)
@@ -93,11 +93,12 @@ Available commands:
   listeners                List active listeners
   interfaces               Show network interfaces
   tasks                    Show background tasks
+  detach                   Detach session and return to menu
   help                     Show this help
 root@target:~#
 ```
 
-Works in both regular attached sessions and tmux auto-split panes. The shell stays active while you run commands — no need to detach to the Main Menu.
+Works in both regular attached sessions and tmux auto-split panes. The shell stays active while you run commands — no need to detach to the Main Menu. Use the `detach` command to return to the menu without killing the session.
 
 ## Background Exec
 
@@ -246,7 +247,7 @@ Quality-of-life changes to reduce friction during timed exams:
 
 ## Bug Fixes
 
-80 bugs identified and fixed across multiple review passes (37 initial + 23 reliability + 20 final):
+84 bugs identified and fixed across multiple review passes (37 initial + 23 reliability + 24 final):
 
 | ID | Bug | Fix |
 |----|-----|-----|
@@ -332,6 +333,10 @@ Focused on crash-prevention under real pentest conditions (flaky VPN, dying shel
 | F18 | `readline.get_line_buffer()` crash when readline unavailable | Guard `if readline` |
 | F19 | `single_session` exit check in `do_kill` unreachable | Fixed condition `== 1` → `not core.sessions` |
 | F20 | `bin` property bare `except: pass` swallows `KeyboardInterrupt` | Changed to `except Exception` with debug log |
+| F21 | `kill()` → `detach()` spawns `sync_cwd`/`get_subtype` threads that race against socket closure | Added `dying` flag to skip background threads on session death |
+| F22 | TLV stream corruption during agent upgrade — `agent=True` and `subchannel.active=False` not set atomically | Set both under `data_route_lock` in `exec(separate=True)` |
+| F23 | Core loop `select()` crash on closed fd (`ValueError: fd=-1`) | Added `ValueError` handler that removes stale fds from rlist |
+| F24 | `interact` crash (`KeyError`) when session dies between menu display and command | Added session existence guard |
 
 ---
 
@@ -427,7 +432,7 @@ https://github.com/brightio/penelope/assets/65655412/7295da32-28e2-4c92-971f-094
 
 ### Main Menu Commands
 Some Notes:
-- By default you need to press `F12` to detach the PTY shell and go to the Main Menu. If the upgrade was not possible the you ended up with a basic shell, you can detach it with `Ctrl+C`. This also prevents the accidental killing of the shell.
+- By default you need to press `Ctrl-]` to detach the PTY shell and go to the Main Menu. If the upgrade was not possible and you ended up with a basic shell, you can detach it with `Ctrl+C`. This also prevents the accidental killing of the shell.
 - The Main Menu supports TAB completion and also short commands. For example instead of `interact 1` you can just type `i 1`.
 
 ![Main Menu](https://github.com/user-attachments/assets/b3f568bc-5e66-4e6f-9510-3e61a3518e82)
@@ -501,7 +506,7 @@ So as long as you know what you’re doing, there should be no issues. If you wa
 
 ### ► How can I return from the remote shell to the Main Menu?
 It depends on the type of shell upgrade in use:
-* PTY: press `F12`
+* PTY: press `Ctrl-]` (same as telnet/netcat escape)
 * Readline: send EOF (`Ctrl-D`)
 * Raw: send SIGINT (`Ctrl-C`)
 
