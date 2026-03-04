@@ -152,6 +152,9 @@ def dispatch_penelope_command(session, cmd_line, respond):
 	cmd = parts[0].lower()
 	args = parts[1] if len(parts) > 1 else ''
 
+	if cmd in ('exit', 'quit', 'q', 'back'):
+		return 'exit'
+
 	if cmd == 'help':
 		respond(COMMAND_MODE_HELP)
 		return
@@ -2166,7 +2169,11 @@ class Core:
 	def loop(self):
 
 		while self.started:
-			readables, writables, _ = select(self.rlist, self.wlist, [])
+			try:
+				readables, writables, _ = select(self.rlist, self.wlist, [])
+			except ValueError:
+				self.rlist = [r for r in self.rlist if hasattr(r, 'fileno') and r.fileno() >= 0]
+				continue
 
 			for readable in readables:
 
@@ -2208,7 +2215,13 @@ class Core:
 							else:
 								session.detach()
 						elif data == b'\x0f' and session.type == 'PTY':
-							self._command_mode(session)
+							self.rlist.remove(sys.stdin)
+							threading.Thread(
+								target=self._command_mode,
+								args=(session,),
+								name="CommandMode",
+								daemon=True
+							).start()
 						else:
 							if session.type == 'Raw':
 								session.record(data, _input=not session.interactive)
@@ -2318,20 +2331,42 @@ class Core:
 					if not remaining:
 						self.wlist.remove(writable)
 
+	_command_mode_commands = [
+		'upload', 'download', 'run', 'spawn', 'script',
+		'sessions', 'listeners', 'interfaces', 'tasks',
+		'help', 'exit', 'quit', 'back',
+	]
+
 	def _command_mode(self, session):
-		"""Handle Ctrl+O command mode for regular (STDIN) sessions."""
+		"""Handle Ctrl+O command mode in a separate thread so the Core loop
+		continues routing socket data (required for agent exec)."""
 		termios.tcsetattr(sys.stdin, termios.TCSADRAIN, TTY_NORMAL)
+		def respond(msg):
+			print(f"\n{msg}")
+		def completer(text, state):
+			matches = [c for c in self._command_mode_commands if c.startswith(text)]
+			return matches[state] if state < len(matches) else None
 		try:
-			sys.stdout.write("\r\npenelope> ")
-			sys.stdout.flush()
-			cmd_line = sys.stdin.readline().strip()
-		except (EOFError, OSError):
-			cmd_line = ''
+			print()
+			while True:
+				cmd_line = input("penelope> ", completer=completer).strip()
+				if not cmd_line:
+					break
+				result = dispatch_penelope_command(session, cmd_line, respond)
+				if result == 'exit':
+					break
+		except (EOFError, OSError, KeyboardInterrupt):
+			pass
 		tty.setraw(sys.stdin)
-		if cmd_line:
-			def respond(msg):
-				stdout(f"\r\n{msg.replace(chr(10), chr(13)+chr(10))}\r\n".encode())
-			dispatch_penelope_command(session, cmd_line, respond)
+		stdout(b"\r\n")
+		# Send a newline to the remote shell to trigger a fresh prompt
+		data = b'\n'
+		if session.agent:
+			data = Messenger.message(Messenger.SHELL, data)
+		session.send(data, stdin=True)
+		if sys.stdin not in self.rlist:
+			self.rlist.append(sys.stdin)
+			core.control << ''
 
 	def stop(self):
 		options.maintain = 0
@@ -3228,13 +3263,19 @@ class Session:
 	def cwd(self):
 		if self._cwd is None:
 			if self.OS == 'Unix':
-				cmd = (
-				    f"readlink /proc/{self.shell_pid}/cwd 2>/dev/null || "
-				    f"lsof -p {self.shell_pid} 2>/dev/null | awk '$4==\"cwd\" {{print $9;exit}}' | grep . || "
-				    f"procstat -f {self.shell_pid} 2>/dev/null | awk '$3==\"cwd\" {{print $NF;exit}}' | grep . || "
-				    f"pwdx {self.shell_pid} 2>/dev/null | awk '{{print $2;exit}}' | grep ."
-				)
-				self._cwd = self.exec(cmd, value=True)
+				if self.agent:
+					self._cwd = self.exec(
+						"stdout_stream << os.getcwd().encode()",
+						python=True, value=True
+					)
+				else:
+					cmd = (
+					    f"readlink /proc/{self.shell_pid}/cwd 2>/dev/null || "
+					    f"lsof -p {self.shell_pid} 2>/dev/null | awk '$4==\"cwd\" {{print $9;exit}}' | grep . || "
+					    f"procstat -f {self.shell_pid} 2>/dev/null | awk '$3==\"cwd\" {{print $NF;exit}}' | grep . || "
+					    f"pwdx {self.shell_pid} 2>/dev/null | awk '{{print $2;exit}}' | grep ."
+					)
+					self._cwd = self.exec(cmd, value=True)
 			elif self.OS == 'Windows':
 				self._cwd = self.exec("cd", force_cmd=True, value=True)
 		return self._cwd or ''
@@ -4063,10 +4104,13 @@ class Session:
 
 	def sync_cwd(self):
 		self._cwd = None
-		if self.agent:
-			self.exec("os.chdir({})".format(repr(self.cwd)), python=True, value=True)
-		elif self.need_control_session:
-			self.exec(f"cd {self.cwd}")
+		try:
+			if self.agent:
+				self.exec("os.chdir({})".format(repr(self.cwd)), python=True, value=True)
+			elif self.need_control_session:
+				self.exec(f"cd {self.cwd}")
+		except OSError:
+			pass
 
 	def get_subtype(self):
 		response = self.exec("$PSVersionTable", expect_func=lambda x: b":\\" in x, raw=True)
@@ -4092,7 +4136,8 @@ class Session:
 
 		core.wait_input = False
 		core.attached_session = None
-		core.rlist.remove(sys.stdin)
+		if sys.stdin in core.rlist:
+			core.rlist.remove(sys.stdin)
 
 		if self.type == 'Readline':
 			try:
@@ -4120,6 +4165,10 @@ class Session:
 		return True
 
 	def download(self, remote_items):
+		if self.need_control_session and not self.control_session:
+			logger.error("Download requires a background shell. Use 'spawn' to create one, then retry")
+			return []
+
 		# Initialization
 		try:
 			shlex.split(remote_items) # Early check for shlex errors
@@ -4408,7 +4457,16 @@ class Session:
 	def upload(self, local_items, remote_path=None, randomize_fname=False, url_to_bytes_fn=None):
 
 		url_to_bytes_fn = url_to_bytes_fn or url_to_bytes
+
+		if self.need_control_session and not self.control_session:
+			logger.error("Upload requires a background shell. Use 'spawn' to create one, then retry")
+			return []
+
 		destination = remote_path or self.cwd
+
+		if not destination:
+			logger.error("Cannot determine remote working directory for upload")
+			return []
 
 		if not self.write_access(destination):
 			return []
@@ -6150,6 +6208,10 @@ def custom_excepthook(*args):
 		exc_type, exc_value, exc_traceback = args
 	else:
 		return
+	try:
+		termios.tcsetattr(sys.stdin, termios.TCSADRAIN, TTY_NORMAL)
+	except:
+		pass
 	print("\n", paint('Oops...').RED, f'{EMOJIS["bug"]}\n', paint().yellow, '─' * 80, sep='')
 	sys.__excepthook__(exc_type, exc_value, exc_traceback)
 	print('─' * 80, f"\n{paint('Penelope version:').red} {paint(__version__).green}")
